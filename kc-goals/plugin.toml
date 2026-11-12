@@ -1,0 +1,72 @@
+# Manifest form of the registration.
+#
+# The host discovers this file at `<data_dir>/plugins/kc-goals/plugin.toml`, where
+# `<data_dir>` defaults to ~/.local/share/karucode. Copy it there, then rescan
+# (`POST /api/plugins/reload`) or restart.
+#
+# Use EITHER this file OR a `[[plugins]]` entry in config.toml, never both: a name
+# registered twice fails the slot with an error naming both sources.
+#
+# Note what a manifest cannot carry: `settings.read_only_tools` and
+# `settings.trust` are operator-only, so they are ignored here and only honoured
+# from config.toml. If you want goal_status/goal_list to skip the approval prompt,
+# or goal_check to run commands, register the plugin in config.toml instead.
+
+name = "kc-goals"
+# Absolute: the plugin is spawned by the server, whose working directory is not
+# this one.
+command = ["/home/karutoil/karucode-plugins/kc-goals/target/release/kc-goals"]
+enabled = true
+
+# Goals live in the workspace, and the engine talks to the loopback server that
+# spawned it. `shell` is only needed for `goal_check` (a criterion judged by a
+# command); leave it out and that tool is not registered at all.
+permissions = ["files.read", "files.write", "network", "shell"]
+
+[settings]
+# The server this plugin may resume runs on. Plain HTTP, loopback only: a remote
+# or https:// address is reported as a configuration error rather than silently
+# downgraded.
+server = "http://127.0.0.1:8787"
+
+# Only needed when the server runs with KARUCODE_AUTH_TOKEN. A plugin's
+# environment is cleared, so the token cannot be inherited - it goes here.
+# token = ""
+
+# How often the reconciler re-examines sessions that have an open goal. This is
+# the recovery path for a dropped hook, a plugin restart, a server restart and a
+# POST that failed, so it should stay well under a minute.
+tick_secs = 20
+
+# Floor between two continuations. After failed runs it doubles (up to 5 min), so
+# an endpoint that is down is retried forever but cheaply.
+min_gap_secs = 5
+
+# ── no budget ─────────────────────────────────────────────────────────────
+# A goal runs until it is finished. These are the ceilings a human may add on
+# purpose; 0 means "no limit", and 0 is the default for all of them.
+# max_continuations = 0   # as often as it takes
+# max_minutes = 0         # no deadline
+# max_failed_retries = 0  # keep retrying a failing provider, with backoff
+
+# Not a budget: the number of resumes in a row in which the run did NOTHING -
+# no tool call and no `goal_progress` note - before the goal is paused. The count
+# comes from the harness's tool-call counter, so a long piece of work resets it.
+# 0 disables it (a model that only says "done" would then loop forever).
+max_stalled_resumes = 5
+
+# ── command-checked criteria (optional) ───────────────────────────────────
+# A criterion may carry a `check` command whose exit code is the evidence, so the
+# agent cannot close it on its own word. This runs `/bin/sh -c` in the workspace
+# with the plugin's own OS rights - the server user's, not a sandbox - so it is
+# off unless you say otherwise. It also needs `shell` in the permissions above.
+verify_commands = false
+# check_timeout_secs = 120
+
+# Turn the whole engine off without uninstalling: the tools and the panel keep
+# working, and a stopped run simply stays stopped.
+auto_continue = true
+
+# Put the (byte-stable) orientation block in the system prompt while a goal is
+# open. Off means the model only learns about the goal when it calls goal_status.
+prompt = true

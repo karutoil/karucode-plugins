@@ -1,0 +1,47 @@
+# Manifest form of the plugin registration.
+#
+# The host discovers this file at `<data_dir>/plugins/<name>/plugin.toml`, where
+# `<data_dir>` defaults to ~/.local/share/karucode. Install it with:
+#
+#   karucode-install.sh            # copies the manifest, prints what to do
+#
+# Or register the plugin in ~/.config/karucode/config.toml instead (see
+# README.md §3); a duplicate name in both places is reported as an error rather
+# than silently picking one.
+#
+# `command` must be an absolute path: the plugin is spawned by the server, whose
+# working directory is not this one.
+
+name = "kc-todo"
+command = ["/home/karutoil/karucode-plugins/kc-todo/target/release/kc-todo"]
+enabled = true
+
+# The list lives in the workspace, so the plugin reads and writes files.
+# Fail-closed: an entry listing nothing grants nothing, whatever the manifest
+# declares.
+permissions = ["files.read", "files.write"]
+
+# The plugin also declares one inspector panel (`todo`), which the web UI shows
+# as a tab automatically. That needs no key here: a panel is part of the plugin's
+# own manifest, not of this registration, so there is nothing to configure and
+# nothing to forget.
+
+# Settings are all optional; these are the defaults, shown so they are
+# discoverable.
+[settings]
+# Concurrent in_progress items before `allow_parallel` is required.
+max_in_progress = 1
+# Put work a run left unfinished into the next prompt.
+carry_over_reminder = true
+# Item count where the prompt block summarises instead of listing everything.
+compact_from = 24
+# One list file per session, relative to the workspace. Per session, not per
+# project: two conversations about the same repository are two pieces of work.
+sessions_dir = ".karucode/todo/sessions"
+# The old project-wide list. Read once to seed a session that has none of its
+# own (see the migration note in README), then never written again.
+list_path = ".karucode/todo/list.json"
+# Every plugin tool is `external`, so it always prompts for approval. These two
+# only read, so skipping the prompt for them is safe and makes the agent's
+# status checks cheap.
+read_only_tools = ["todo_list", "todo_audit"]

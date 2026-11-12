@@ -1,0 +1,25 @@
+# Install by copying this manifest to <data_dir>/plugins/deep-research/plugin.toml
+# (./install.sh does that) or use an equivalent [[plugins]] config entry.
+
+name = "deep-research"
+command = ["/home/karutoil/karucode-plugins/kc-deep-research/target/release/deep-research"]
+enabled = true
+
+# The worker process spawns free-search-mcp and fetches the web. Job state stays
+# in memory; no tool writes into the user's project.
+permissions = ["shell", "network"]
+
+[settings]
+# command = ["uvx", "--from", "free-search-mcp==0.17.0", "search-mcp"]
+call_timeout_secs = 50
+start_timeout_secs = 120
+max_output_bytes = 20000
+max_active_jobs = 2
+
+# Approval exemptions are operator-only. If polling must not prompt in ask mode,
+# register through config.toml and set read_only_tools there (see README §1).
+
+# cache_dir = "/home/karutoil/.cache/search-mcp"
+# [settings.env]
+# SEARCH_MCP_PROXY = "socks5://127.0.0.1:1080"
+# SEARCH_MCP_REGION = "us-en"

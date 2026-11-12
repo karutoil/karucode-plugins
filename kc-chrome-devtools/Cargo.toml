@@ -1,0 +1,25 @@
+[package]
+name = "kc-chrome-devtools"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "karucode plugin: drive and inspect a real Chrome/Chromium browser over the DevTools Protocol"
+
+[lib]
+name = "kc_chrome_devtools"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kc-chrome-devtools"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
+# The plugin SDK is not published to crates.io; it ships with the karucode
+# source tree. Point this at wherever that checkout lives.
+kc-plugin-sdk = { path = "/home/karutoil/karucode/crates/kc-plugin-sdk" }
+
+[profile.release]
+strip = true

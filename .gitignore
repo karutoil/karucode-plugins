@@ -1,0 +1,13 @@
+# karucode local runtime state: per-session goals and TODO lists.
+.karucode/
+
+# Rust build output (each plugin crate has its own target/).
+target/
+
+# Not published from this repository.
+kc-knowledge-graph/
+
+# Never commit credentials or run logs.
+.env
+*.log
+.DS_Store

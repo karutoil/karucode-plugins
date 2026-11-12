@@ -1,0 +1,19 @@
+# Example/installed manifest. `install.sh` rewrites both absolute paths.
+# To use the config-file route instead, adapt this into one [[plugins]] entry.
+# Do not register the same name in both sources.
+name = "lightpanda"
+command = ["/home/karutoil/karucode-plugins/kc-lightpanda/target/release/kc-lightpanda"]
+enabled = true
+permissions = ["shell", "network"]
+
+[settings]
+browser_path = "/home/karutoil/karucode-plugins/kc-lightpanda/target/browser/lightpanda"
+viewport = { width = 1440, height = 900 }
+protocol_timeout_secs = 30
+startup_timeout_secs = 30
+max_snapshot_nodes = 500
+telemetry = false
+obey_robots = false
+extra_args = []
+# screenshot_dir = "/tmp"
+# web_socket_url = "ws://127.0.0.1:9222/" # use an external server instead

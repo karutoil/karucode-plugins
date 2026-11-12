@@ -1,0 +1,28 @@
+[package]
+name = "image-handoff"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "karucode plugin: hand images to a configured vision model so a text-only model can see"
+
+[[bin]]
+name = "image-handoff"
+path = "src/main.rs"
+
+# The SDK is vendored in src/sdk.rs and src/protocol.rs, so nothing here points
+# into a karucode checkout or at a published karucode crate. Refresh both with
+# `karucode plugin sdk .` after upgrading karucode.
+#
+# `rusqlite` (against the system sqlite) and `toml` read karucode's own
+# provider configuration so the plugin can pin a session to one of karucode's
+# vision models. `ureq` (rustls TLS) is only for fetching an image given by a
+# remote `url` - the vision call itself is karucode's runtime, not this plugin.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["tls", "json", "charset"] }
+rusqlite = { version = "0.31", default-features = false }
+toml = "0.8"
+
+[profile.release]
+strip = true

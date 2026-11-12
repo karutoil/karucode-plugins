@@ -1,0 +1,23 @@
+[package]
+name = "kc-lightpanda"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "karucode plugin: drive and inspect Lightpanda over the Chrome DevTools Protocol"
+
+[lib]
+name = "kc_lightpanda"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kc-lightpanda"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
+# sdk.rs and protocol.rs are vendored copies guarded by `karucode plugin sdk . --check`.
+
+[profile.release]
+strip = true

@@ -1,0 +1,28 @@
+# Install by copying this manifest to <data_dir>/plugins/image-handoff/plugin.toml
+# (./install.sh does that) or use an equivalent [[plugins]] config entry.
+#
+# The plugin drives karucode itself: every image goes through a temporary
+# karucode session (pinned to one of karucode's own vision models), so the
+# model, endpoint and credentials all come from karucode's configuration.
+# The one thing this manifest cannot carry is the API token the plugin needs
+# to talk to the server - set it through the `env` table of the operator's
+# [[plugins]] entry (see README §2).
+
+name = "image-handoff"
+command = ["/home/karutoil/karucode-plugins/kc-image-handoff/target/release/image-handoff"]
+enabled = true
+permissions = ["files.read", "network"]
+
+[settings]
+# The karucode server that spawned this plugin (plain HTTP, loopback).
+server = "http://127.0.0.1:8787"
+# Optional: pin the vision model (a karucode model id; the provider is found
+# automatically, or name it explicitly with `provider`).
+# model = "od/deepseek-v4.1-flash"
+# provider = "omniroute"
+# One whole handoff (session -> run -> answer) must fit inside this.
+# run_timeout_secs = 55
+# max_image_mb = 8 (the server's upload ceiling)
+# max_output_chars = 12000
+# Token via environment instead of the env table:
+# api_token_env = "IMAGE_HANDOFF_TOKEN"

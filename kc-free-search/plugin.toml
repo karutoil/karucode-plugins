@@ -1,0 +1,106 @@
+# Manifest form of the plugin registration.
+#
+# The host discovers this file at `<data_dir>/plugins/free-search/plugin.toml`,
+# where `<data_dir>` defaults to ~/.local/share/karucode. Install it with:
+#
+#   ./install.sh            # copies the manifest, prints what changed
+#
+# Or register the plugin in ~/.config/karucode/config.toml instead (see
+# README.md §2); a duplicate name in both places is reported as an error rather
+# than silently picking one.
+#
+# `command` must be an absolute path: the plugin is spawned by the server, whose
+# working directory is not this one.
+
+name = "free-search"
+command = ["/home/karutoil/karucode-plugins/kc-free-search/target/release/free-search"]
+enabled = true
+
+# The plugin spawns the Python backend and the backend reaches the network.
+# Fail-closed, as everywhere: an entry that grants nothing gets no tools, and a
+# manifest cannot grant itself a permission this list does not name.
+#
+# `files.write` is here for `download` alone. The host maps a `mutating` tool to
+# `files.write` and withholds the tool without it, so granting it is what makes
+# the documented 11-tool surface real rather than 10 tools and a silent omission.
+# It does NOT let a call skip the prompt: every plugin tool is `external`, and
+# `download` is deliberately absent from `read_only_tools` below, so it still goes
+# through the approval policy every time. Drop this permission if you would
+# rather the tool simply did not exist (nothing else uses it).
+permissions = ["shell", "network", "files.write"]
+
+# The plugin also declares one inspector panel (`status`), which the web UI shows
+# as a tab automatically. A panel is part of the plugin's own manifest, not of
+# this registration, so there is nothing to configure here.
+
+[settings]
+# The backend to supervise. This is what the upstream README documents for a
+# stdio MCP client; it needs no checkout and no API key. Pin a version with
+# ["uvx", "--from", "free-search-mcp==0.17.0", "search-mcp"] if you want
+# upgrades to be deliberate — the tool schemas are vendored for 0.17.0, and the
+# panel reports drift against whatever is actually running.
+# command = ["uvx", "--from", "free-search-mcp", "search-mcp"]
+
+# Seconds one tool call may take inside the plugin. It is spent after the
+# plugin has the backend lock, so this plus the 8s lock wait is what has to fit
+# inside karucode's 60s plugin budget: this plugin answers first, with a message
+# that says how to narrow the request, instead of letting the harness cut the
+# call generically.
+call_timeout_secs = 50
+
+# Seconds the backend may take to answer `initialize`. The first `uvx` run on a
+# fresh machine resolves and installs about ninety Python packages, which is a
+# one-off minute rather than a hang. Every later start is well under a second.
+start_timeout_secs = 120
+
+# Bytes of a result kept for the model. Sits just under karucode's own
+# `limits.max_tool_output_bytes` (default 24000) so this plugin gets to explain
+# how to read the rest before the harness truncates it generically.
+max_output_bytes = 20000
+
+# Start the backend when the plugin starts, so the first search does not pay for
+# interpreter start and engine imports. Set false to hold no Python process while
+# no search is being made.
+prewarm = true
+
+# Every plugin tool is `external`, so it always goes through the approval policy.
+# A plugin cannot exempt itself by declaring `read_only`; these are the calls the
+# operator vouches for. All of them only read: `search`, `fetch`, `research`,
+# `fetch_batch`, `read_doc`, `cache_search`, `engines`, `compare`,
+# `extract_structured` and `paper_graph` cannot change anything the user owns.
+#
+# `download` is deliberately absent: it writes a file outside the project
+# directory, so it keeps prompting. The plugin's panel lists this same set under
+# `config.read_only_candidates`, derived from the tool table, so the two cannot
+# drift.
+read_only_tools = [
+  "search",
+  "fetch",
+  "research",
+  "fetch_batch",
+  "read_doc",
+  "cache_search",
+  "engines",
+  "compare",
+  "extract_structured",
+  "paper_graph",
+]
+
+# Everything below is optional and off by default; they are the upstream
+# `SEARCH_MCP_*` variables, passed through to the backend. karucode hands a plugin
+# a cleared environment, so this table is the only way to reach them. See the
+# upstream .env.example for the full list.
+#
+# [settings.env]
+# SEARCH_MCP_CACHE_DIR = "/home/karutoil/.cache/search-mcp"
+# SEARCH_MCP_PROXY = "socks5://127.0.0.1:1080"
+# SEARCH_MCP_REGION = "us-en"
+# SEARCH_MCP_DEFAULT_ENGINES = '["duckduckgo","bing","anysearch"]'
+
+# Shorthand for SEARCH_MCP_CACHE_DIR; `env` wins if both are set.
+# cache_dir = "/home/karutoil/.cache/search-mcp"
+
+# Expose only these backend tools. Empty means all of them. Useful to run the
+# plugin as a pure search tool (["search", "fetch", "research"]) in a workspace
+# where `download` has no business existing.
+# tools = []

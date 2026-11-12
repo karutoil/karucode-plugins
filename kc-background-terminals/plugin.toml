@@ -1,0 +1,6 @@
+# Sample registration. install.sh writes the checkout's absolute binary path.
+# Do not register the same name in config.toml and the data directory.
+name = "background-terminals"
+command = ["/absolute/path/to/kc-background-terminals/target/release/kc-background-terminals"]
+enabled = true
+permissions = ["shell"]
