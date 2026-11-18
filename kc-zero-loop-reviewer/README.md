@@ -546,3 +546,8 @@ Fault injection covers truncated input at 1%, 50% and one byte short;
 cancellation at input-write and output-read; timeout kills; nonzero exit with a
 valid JSON payload (`process_crash`); empty and malformed output; write-flag and
 workspace-mutation refusal; and receipt tampering.
+
+The Rust, Go and JavaScript/TypeScript probe tests run the real `cargo`/`go`/`node`
+toolchain against a throw-away project and skip when it is absent; the container
+path is covered by the pure argv/script tests, so a host without those images
+still exercises the dispatch logic.
