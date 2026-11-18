@@ -20,7 +20,7 @@ Five stages run inside a 1–4 minute CI budget:
    risk; removing one must not lower it), and DesignLore precedent checks.
 5. **Coded controller** — policy-free risk elicitation, an independent k=5
    monitor, log-odds fusion and the Bayes threshold in host code, a configurable
-   publication cap (default 10),
+   dynamic publication cap (all verified, safety ceiling 50),
    one-click suggestions, and AFCRA-style security redaction.
 
 Every attempt writes an immutable, hash-chained receipt. A stage that cannot
@@ -66,7 +66,7 @@ values:
 | `review.deadline_secs` | `240` | Hard review budget; set `3600` for a huge PR |
 | `review.stage2_timeout_secs` | `60` | One parallel static track |
 | `review.max_model_tokens` | `500000` | Context ceiling (tokens) |
-| `review.max_findings` | `10` | Verified findings published per review (1–50) |
+| `review.max_findings` | `0` | `0` = every verified finding up to 50; or an explicit 1–50 cap |
 | `fusion.c_fr` / `fusion.c_fa` | `10` / `1` | Coded Bayes τ = C_FR/(C_FA+C_FR) = 0.909; host-side only |
 | `fusion.monitor_votes` | `5` | Independent monitor samples |
 | `fusion.disagreement_threshold` | `0.55` | Wider reviewer/monitor gap → human review |
@@ -172,7 +172,7 @@ non-loopback bind without a secret is refused. The secret variable is
 
 `./check.sh` runs everything below. On this machine:
 
-* **439 tests pass** (real git, real Semgrep 1.173.0, real podman 5.4.2,
+* **440 tests pass** (real git, real Semgrep 1.173.0, real podman 5.4.2,
   a real OpenAI-compatible HTTP fake for the client tests).
 * `python3 eval/run_eval.py` on the annotated corpus: **6/6 buggy cases
   intercepted, 0/4 clean or fix-confirming cases flagged**, in ~33 s for all ten cases.
@@ -219,8 +219,8 @@ characters, four batches in flight at once. Large files are split at hunk
 boundaries; a file with one enormous hunk is a declared blind spot unless it is
 a test file. Semgrep scans the complete changed-file set in chunks of at most
 200 paths, and up to 24 hypotheses reach the probe/CIVER stages, which are
-capped at 16 each. Up to the configured `review.max_findings` verified findings
-are published (default 10; max 50).
+capped at 32 each. Every verified finding is published up to the safety ceiling
+of 50; `review.max_findings` can impose a lower explicit cap.
 
 A 1,000–2,000 line PR usually takes one to three model calls. A 9k-line,
 83-file PR is about 24 calls and can legitimately take 20–40 minutes; the
@@ -250,8 +250,8 @@ This is a **coverage** guarantee, not a recall guarantee. On the 9.6k-line
 PR #17 it covered all **6,492 production changed lines** with zero missing
 assignments and added 725 enclosing-function slices to the context. It still
 cannot promise 99.9% bug recall: the model is probabilistic, verification can
-reject a real but hard-to-reproduce defect, and the publication cap defaults
-to 10 findings rather than being unlimited.
+reject a real but hard-to-reproduce defect, and publication still stops at the
+safety ceiling of 50 rather than being unbounded.
 
 ## Why a clean diff has no comments
 
@@ -283,10 +283,12 @@ candidate cannot be verified it fails open to `human_review` with a receipt.
   as discounted instead of pretending they cover HEAD.
 * This environment needs `--uts=host` for podman (already the default in
   `extra_args`) and cannot bind-mount `/tmp`; keep `state.dir` under `/home`.
-* The publication cap defaults to 10 and is adjustable 1–50. Findings beyond
-  it are recorded as suppressed with a `publication cap` reason; the decision
-  still reflects the worst finding. Every extra finding costs another inline
-  comment and another verified suggestion.
+* The publication cap is dynamic: `0` (the default) publishes every verified
+  finding up to the safety ceiling of 50. An explicit 1–50 value caps it
+  lower. Findings beyond the effective cap are recorded as suppressed with a
+  `publication cap` reason; the decision still reflects the worst finding.
+  Every extra finding costs another inline comment and another verified
+  suggestion.
 * A single-hunk repair is rendered as a native `suggestion` block (one click). A
   multi-hunk repair is rendered as a verified `diff` block, because a provider
   suggestion covers exactly one line range.

@@ -285,9 +285,9 @@ SETTING_DECLARATIONS: list[dict[str, Any]] = [
         "key": "review.max_findings",
         "label": "Public findings cap",
         "type": "number",
-        "default": 10,
-        "help": "Maximum verified findings published in one review (1–50).",
-        "min": 1,
+        "default": 0,
+        "help": "0 = publish every verified finding up to the safety ceiling of 50; 1–50 = explicit cap.",
+        "min": 0,
         "max": 50,
     },
 ]
@@ -461,7 +461,7 @@ class Settings:
     deadline_s: float = 240.0
     stage2_timeout_s: float = 60.0
     probe_attempts: int = 3
-    max_findings: int = 10
+    max_findings: int = 0
     designlore_files: tuple[str, ...] = (
         "AGENTS.md",
         ".cursorrules",
@@ -802,7 +802,7 @@ def load_settings(
         deadline_s=float(get("review.deadline_secs", 240)),
         stage2_timeout_s=float(get("review.stage2_timeout_secs", 60)),
         probe_attempts=max(1, min(3, int(get("review.probe_attempts", 3)))),
-        max_findings=max(1, min(50, int(get("review.max_findings", 10)))),
+        max_findings=max(0, min(50, int(get("review.max_findings", 0)))),
     )
 
 

@@ -89,7 +89,8 @@ def select_with_receipts(
     The cap is the smaller of ``max_findings`` and :data:`MAX_FINDINGS`, so a
     caller cannot widen it.  Ranking is ``(severity, p_combined)`` descending.
     """
-    cap = max(0, min(int(max_findings), MAX_FINDINGS))
+    requested = int(max_findings)
+    cap = MAX_FINDINGS if requested <= 0 else max(0, min(requested, MAX_FINDINGS))
     publishable: list[Candidate] = []
     suppressed: list[Candidate] = []
     for candidate in findings:

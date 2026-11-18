@@ -82,8 +82,8 @@ BEHAVIOR_WORKERS = 4
 
 #: Stage 3/4 are expensive and model-backed; the top candidates get the budget,
 #: the rest stay unverified and therefore cannot be published silently.
-MAX_PROBED_CANDIDATES = 16
-MAX_CIVER_CANDIDATES = 16
+MAX_PROBED_CANDIDATES = 32
+MAX_CIVER_CANDIDATES = 32
 from .stage5 import redaction as redaction_mod
 
 
@@ -1384,7 +1384,7 @@ class Reviewer:
             decision=decision,
             p_combined=max(0.0, min(1.0, p_combined)),
             tau=tau,
-            findings=findings[: self.settings.max_findings],
+            findings=findings[: (self.settings.max_findings or formatter_mod.MAX_FINDINGS)],
             suppressed_count=len(suppressed),
             redacted_count=sum(1 for finding in findings if finding.redacted),
             receipts=list(self._receipts),

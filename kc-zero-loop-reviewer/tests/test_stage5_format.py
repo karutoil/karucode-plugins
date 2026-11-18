@@ -150,7 +150,12 @@ def test_select_ranks_by_severity_then_probability() -> None:
 def test_select_cannot_be_asked_for_more_than_fifty() -> None:
     candidates = [_candidate(f"c-{index}") for index in range(55)]
     assert len(select(candidates, 100)) == 50
-    assert len(select(candidates, 0)) == 0
+    assert len(select(candidates, 0)) == 50
+
+
+def test_zero_means_all_verified_findings_up_to_the_safety_ceiling() -> None:
+    candidates = [_candidate(f"c-{index}") for index in range(20)]
+    assert len(select(candidates, 0)) == 20
 
 
 def test_a_finding_without_a_verified_fix_is_suppressed_with_a_reason() -> None:
