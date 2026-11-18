@@ -174,16 +174,44 @@ def probe_prompt(
     attempt: int,
     previous_failure: str = "",
     project_files: Sequence[str] = (),
+    language: str = "python",
+    framework: str = "pytest",
 ) -> Prompt:
+    language_rules = {
+        "python": (
+            "One test file, pytest style, importing from the project as it is laid out "
+            "(see project_files). Use `framework: pytest` (or unittest only if the project has no pytest)."
+        ),
+        "rust": (
+            "One Rust integration test under tests/ (for example tests/zl_probe_<name>.rs), "
+            "with `#[test]` and `assert!`/`assert_eq!`. Use `framework: cargo` and import the crate by its package name. "
+            "Do not add dependencies or use the network; the sandbox runs `cargo test --offline`."
+        ),
+        "typescript": (
+            "One TypeScript/JavaScript test file using `node:test` and `node:assert` or `expect`. "
+            "Use `framework: node` for .js/.mjs or `framework: tsx` for .ts/.tsx. "
+            "Do not add dependencies or use the network."
+        ),
+        "javascript": (
+            "One JavaScript test file using `node:test` and `node:assert`. Use `framework: node`. "
+            "Do not add dependencies or use the network."
+        ),
+        "go": (
+            "One Go *_test.go file in the package under test, using `testing` and `t.Fatalf`/`t.Errorf` "
+            "with a boundary case. Use `framework: go`. Do not add modules or use the network; "
+            "the sandbox runs `go test`."
+        ),
+    }.get(language, "Use the project's existing test framework.")
     user = _join(
         _schema("ProbeSpec", ProbeSpec),
         _evidence("defect_card", candidate.model_dump(mode="json"), 12000),
         _evidence("context", context.text, 16000),
         _evidence("project_files", list(project_files)[:200], 4000),
+        _evidence("language", {"language": language, "framework": framework}, 1000),
         _evidence("previous_probe_failure", previous_failure, 6000) if previous_failure else "",
         f"""Task: write a self-contained reproduction test for the defect card (attempt {attempt} of 3).
 Rules:
-- One test file, pytest style, importing from the project as it is laid out (see project_files).
+- {language_rules}
 - Assert on RETURN VALUES and on STATE mutations. Use boundary inputs (empty, zero, one, maximum, duplicate, malformed) that the defect card names.
 - The test must FAIL because of the defect, not because of an import, fixture or environment problem. Do not use the network.
 - Do not assert current buggy values just to make the test pass.

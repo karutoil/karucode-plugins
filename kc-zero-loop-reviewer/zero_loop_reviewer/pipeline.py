@@ -1822,27 +1822,29 @@ def _context_for_batch(context: ContextSlice, paths: set[str]) -> ContextSlice:
 
 
 def _probe_supported(candidate: Candidate) -> bool:
-    """Probe synthesis currently emits Python tests only.
+    """Probe synthesis supports Python, Rust, Go and JavaScript/TypeScript.
 
-    Running a Python probe against a Rust or TypeScript tree produces a
-    ``BOTH_FAIL`` classification that is an environment artefact, not an
-    omission defect.  Those candidates must go through an analyzer rerun in
-    CIVER instead.
+    A probe still has to compile and assert in the sandbox; an unsupported
+    toolchain produces a setup error and the candidate stays unverified.
     """
     if not candidate.cited_sites:
         return False
-    return candidate.cited_sites[0].path.endswith((".py", ".pyi"))
+    path = candidate.cited_sites[0].path
+    if path.endswith((".py", ".pyi", ".go", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".rs")):
+        return True
+    return False
 
 
 def _groundable(site: CitedSite, findings: Sequence[AnalyzerFinding]) -> bool:
     """Whether the stack can *test* a hypothesis about this site.
 
-    Stage 3 can execute a Python probe; a rule finding can be rerun for any
-    language.  A behavioural guess about YAML, Markdown or a Rust file with no
-    firing rule has no mechanical falsifier, so it must not become a candidate:
-    otherwise every clean docs/workflow PR ends in an unverified human review.
+    Stage 3 can execute a Python, Rust, Go or JavaScript/TypeScript probe; a
+    rule finding can be rerun for any language.  A behavioural guess about YAML,
+    Markdown or another unsupported file has no mechanical falsifier, so it
+    must not become a candidate: otherwise every clean docs/workflow PR ends in
+    an unverified human review.
     """
-    if site.path.endswith((".py", ".pyi")):
+    if site.path.endswith((".py", ".pyi", ".go", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".rs")):
         return True
     return any(
         finding.path == site.path

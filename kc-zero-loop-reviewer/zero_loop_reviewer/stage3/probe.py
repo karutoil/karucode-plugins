@@ -31,6 +31,28 @@ from .sandbox import probe_relative_path
 #: The interface caps synthesis at three attempts.
 MAX_ATTEMPTS = 3
 
+#: Language-specific test conventions.
+_LANGUAGES = {
+    ".py": ("python", "pytest"),
+    ".pyi": ("python", "pytest"),
+    ".rs": ("rust", "cargo"),
+    ".go": ("go", "go"),
+    ".ts": ("typescript", "node"),
+    ".tsx": ("typescript", "node"),
+    ".js": ("javascript", "node"),
+    ".jsx": ("javascript", "node"),
+    ".mjs": ("javascript", "node"),
+    ".cjs": ("javascript", "node"),
+}
+
+
+def language_for(path: str) -> tuple[str, str]:
+    """Return ``(language, framework)`` for a candidate path."""
+    for suffix, pair in _LANGUAGES.items():
+        if path.endswith(suffix):
+            return pair
+    return ("unknown", "")
+
 #: A probe must assert something a defect can break.
 _ASSERTION = re.compile(
     r"(?m)^\s*(?:assert\b|self\.assert\w*\s*\(|pytest\.raises\s*\(|with\s+pytest\.raises)"
@@ -66,7 +88,18 @@ _FATAL_KINDS = (FailureKind.TIMEOUT, FailureKind.CANCELLED, FailureKind.NOT_CONF
 
 
 def has_assertion(content: str) -> bool:
-    return bool(_ASSERTION.search(content or ""))
+    low = (content or "").lower()
+    return bool(
+        _ASSERTION.search(content or "")
+        or "assert!" in low
+        or "assert_eq!" in low
+        or "assert_ne!" in low
+        or "assert." in low
+        or "assert(" in low
+        or "expect(" in low
+        or "t.fatal" in low
+        or "t.error" in low
+    )
 
 
 def has_boundary(content: str) -> bool:
@@ -74,7 +107,7 @@ def has_boundary(content: str) -> bool:
     return any(token in low for token in _BOUNDARY_TOKENS)
 
 
-def inspect_probe(spec: ProbeSpec) -> list[str]:
+def inspect_probe(spec: ProbeSpec, *, language: str = "") -> list[str]:
     """Everything wrong with a proposed probe, as human-readable problems."""
     issues: list[str] = []
     rel_path = ""
@@ -82,13 +115,43 @@ def inspect_probe(spec: ProbeSpec) -> list[str]:
         rel_path = probe_relative_path(spec.test_path)
     except SandboxError as exc:
         issues.append(str(exc))
+    if language:
+        expected = language
+    else:
+        expected, framework = language_for(rel_path or spec.test_path)
+        if not spec.framework or spec.framework == "pytest":
+            spec = spec.model_copy(update={"framework": framework or spec.framework})
     content = spec.content or ""
-    try:
-        compile(content, "<probe>", "exec")
-    except SyntaxError as exc:
-        issues.append(f"the probe does not compile: {exc.msg} (line {exc.lineno})")
-    except ValueError as exc:
-        issues.append(f"the probe cannot be compiled: {exc}")
+    if expected == "python":
+        try:
+            compile(content, "<probe>", "exec")
+        except SyntaxError as exc:
+            issues.append(f"the probe does not compile: {exc.msg} (line {exc.lineno})")
+        except ValueError as exc:
+            issues.append(f"the probe cannot be compiled: {exc}")
+        if spec.framework not in ("pytest", "unittest"):
+            issues.append(f"a Python probe cannot use the {spec.framework!r} framework")
+    elif expected == "go":
+        if spec.framework != "go":
+            issues.append("a Go probe must use framework='go'")
+        if not rel_path.endswith("_test.go"):
+            issues.append("a Go probe must be a *_test.go file")
+        if "func Test" not in content:
+            issues.append("a Go probe must contain a func Test... function")
+    elif expected == "rust":
+        if spec.framework != "cargo":
+            issues.append("a Rust probe must use framework='cargo'")
+        if "#[test]" not in content:
+            issues.append("a Rust probe must contain a #[test] function")
+        if not rel_path.endswith(".rs") or "/tests/" not in f"/{rel_path}":
+            issues.append("a Rust probe must be a tests/*.rs integration test")
+    elif expected in ("typescript", "javascript"):
+        if spec.framework not in ("node", "tsx"):
+            issues.append("a TypeScript/JavaScript probe must use framework='node' or 'tsx'")
+        if not any(marker in content for marker in ("node:test", "from 'node:assert'", 'from "node:assert"', "assert.", "expect(")):
+            issues.append("a TypeScript/JavaScript probe must assert with node:test/node:assert or expect()")
+    else:
+        issues.append(f"the probe language is not supported: {rel_path or spec.test_path}")
     if not has_assertion(content):
         issues.append(
             "the probe has no assertion on a return value or on state; a probe that cannot fail is not a probe"
@@ -97,7 +160,7 @@ def inspect_probe(spec: ProbeSpec) -> list[str]:
         issues.append(
             "the probe does not exercise a boundary input (empty, zero, one, None, duplicate, maximum)"
         )
-    if rel_path and spec.framework == "pytest" and not content.strip():
+    if rel_path and not content.strip():
         issues.append("the probe is empty")
     return issues
 
@@ -131,6 +194,9 @@ def synthesize(
     configured = int(getattr(settings, "probe_attempts", MAX_ATTEMPTS) or MAX_ATTEMPTS)
     attempts = max(1, min(MAX_ATTEMPTS, int(max_attempts), configured))
     files = [str(path) for path in (project_files or ())][:200]
+    language, framework = ("", "")
+    if candidate.cited_sites:
+        language, framework = language_for(candidate.cited_sites[0].path)
     problems: list[str] = []
     previous = ""
     for attempt in range(1, attempts + 1):
@@ -140,6 +206,8 @@ def synthesize(
             attempt=attempt,
             previous_failure=previous,
             project_files=files,
+            language=language,
+            framework=framework,
         )
         try:
             answer = llm.complete("probe", prompt, ProbeSpec, stage_model=settings.llm.probe)
@@ -158,7 +226,11 @@ def synthesize(
             previous = "the answer was not a ProbeSpec object"
             problems.append(f"attempt {attempt}: {previous}")
             continue
-        issues = inspect_probe(spec)
+        if not language:
+            language, framework = language_for(spec.test_path)
+        if framework and spec.framework in ("pytest", "") and framework != "pytest":
+            spec = spec.model_copy(update={"framework": framework})
+        issues = inspect_probe(spec, language=language)
         if validate is not None and not issues:
             try:
                 verdict = str(validate(spec) or "").strip()

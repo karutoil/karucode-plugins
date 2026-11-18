@@ -87,6 +87,15 @@ _SETUP_MARKERS: tuple[tuple[str, str], ...] = (
     ("fixture", "fixture"),
     ("usage error", "usage"),
     ("unrecognized arguments", "usage"),
+    ("could not compile", "compile"),
+    ("failed to compile", "compile"),
+    ("error[E", "compile"),
+    ("error TS", "typescript"),
+    ("cannot find module", "import"),
+    ("module not found", "import"),
+    ("failed to load manifest", "manifest"),
+    ("no test target", "no_tests"),
+    ("undefined:", "compile"),
 )
 
 #: ``needle`` → failure kind for a genuine behavioural failure.
@@ -95,6 +104,12 @@ _BEHAVIOURAL_MARKERS: tuple[tuple[str, str], ...] = (
     ("e   assert", "assertion"),
     ("failed ", "assertion"),
     ("exception raised", "exception"),
+    ("test result: failed", "assertion"),
+    ("panicked at", "panic"),
+    ("assertion failed", "assertion"),
+    ("not ok", "assertion"),
+    ("--- fail", "assertion"),
+    ("fail\t", "assertion"),
 )
 
 _TRACEBACK = re.compile(r'(?:File "(?P<file>[^"]+\.py)", line (?P<line>\d+))|(?m:^(?P<short>[\w./-]+\.py):(?P<shortline>\d+):)', re.MULTILINE)
@@ -119,6 +134,9 @@ class SandboxConfigView:
 
     runtime: str = "podman"
     image: str = DEFAULT_IMAGE
+    rust_image: str = "docker.io/library/rust:1.89-slim"
+    node_image: str = "docker.io/library/node:22-alpine"
+    go_image: str = "docker.io/library/golang:1.23-alpine"
     helper_image: str = "docker.io/library/alpine:latest"
     timeout_s: float = 120.0
     memory_mb: int = 1024
@@ -136,6 +154,9 @@ class SandboxConfigView:
         return cls(
             runtime=str(sandbox.runtime or "none"),
             image=str(sandbox.image or DEFAULT_IMAGE),
+            rust_image=str(sandbox.rust_image or "docker.io/library/rust:1.89-slim"),
+            node_image=str(sandbox.node_image or "docker.io/library/node:22-alpine"),
+            go_image=str(sandbox.go_image or "docker.io/library/golang:1.23-alpine"),
             helper_image=str(sandbox.helper_image or "docker.io/library/alpine:latest"),
             timeout_s=float(sandbox.timeout_s),
             memory_mb=int(sandbox.memory_mb),
@@ -149,6 +170,15 @@ class SandboxConfigView:
 
     def scratch_parent(self) -> Path:
         return Path(self.work_dir)
+
+    def image_for(self, framework: str) -> str:
+        if framework == "cargo":
+            return self.rust_image
+        if framework in ("node", "tsx"):
+            return self.node_image
+        if framework == "go":
+            return self.go_image
+        return self.image
 
     def visibility_problem(self) -> str:
         """Return "" when the scratch root can be bind-mounted, else the reason."""
@@ -184,14 +214,43 @@ def probe_relative_path(test_path: str) -> str:
         raise SandboxError(f"probe path {test_path!r} must stay inside the worktree")
     if not _SAFE_RELATIVE.match(text):
         raise SandboxError(f"probe path {test_path!r} contains characters a shell would interpret")
-    if not text.endswith(".py"):
-        raise SandboxError(f"probe path {test_path!r} is not a Python file")
+    if not text.endswith((".py", ".rs", ".go", ".ts", ".tsx", ".js", ".mjs", ".cjs")):
+        raise SandboxError(
+            f"probe path {test_path!r} is not a Python, Rust, TypeScript or JavaScript file"
+        )
+    if text.endswith(".go") and not text.endswith("_test.go"):
+        raise SandboxError("a Go probe must be a *_test.go file")
+    if text.endswith(".rs") and "/tests/" not in f"/{text}":
+        raise SandboxError("a Rust probe must live under a tests/ directory so cargo test can discover it")
     return text
 
 
 def probe_argv(python: str, rel_path: str, *, framework: str = "pytest") -> list[str]:
     """The command the local runner executes once the probe file is in place."""
     target = f"./{rel_path}"
+    if framework == "cargo":
+        stem = Path(rel_path).stem
+        crate = rel_path.split("/tests/", 1)[0] if "/tests/" in rel_path else "."
+        return [
+            "cargo",
+            "test",
+            "--offline",
+            "--manifest-path",
+            f"{crate}/Cargo.toml",
+            "--test",
+            stem,
+            "--",
+            "--nocapture",
+        ]
+    if framework == "go":
+        directory = str(Path(rel_path).parent) or "."
+        return ["go", "test", f"./{directory}", "-run", "Test"]
+    if framework == "tsx":
+        return ["npx", "--no-install", "tsx", "--test", target]
+    if framework == "node":
+        if rel_path.endswith(".ts"):
+            return ["node", "--experimental-strip-types", "--test", target]
+        return ["node", "--test", target]
     if framework == "unittest":
         return [python, "-m", "unittest", "-v", target]
     return [python, "-m", "pytest", target, "-q", "-p", "no:cacheprovider"]
@@ -206,7 +265,49 @@ def probe_script(rel_path: str, expected_sha: str, *, framework: str = "pytest",
     target = f"{PROBE_ROOT}/{rel_path}"
     # The image name only appears in a human-readable message; keep it inert.
     safe_image = "".join(ch for ch in (image or "(unknown)") if ch not in '"\\$`\n')
-    if framework == "unittest":
+    if framework == "cargo":
+        stem = Path(rel_path).stem
+        crate = rel_path.split("/tests/", 1)[0] if "/tests/" in rel_path else "."
+        preflight = (
+            "command -v cargo >/dev/null 2>&1 || {\n"
+            f'  echo "the sandbox image {safe_image} has no cargo" >&2\n'
+            f"  exit {EXIT_RUNNER_MISSING}\n"
+            "}\n"
+        )
+        command = (
+            "export CARGO_TARGET_DIR=/tmp/zl-target\n"
+            f"cd {PROBE_ROOT}/{crate}\n"
+            f"cargo test --offline --test {stem} -- --nocapture"
+        )
+    elif framework == "node":
+        preflight = (
+            "command -v node >/dev/null 2>&1 || {\n"
+            f'  echo "the sandbox image {safe_image} has no node" >&2\n'
+            f"  exit {EXIT_RUNNER_MISSING}\n"
+            "}\n"
+        )
+        if rel_path.endswith(".ts"):
+            command = f"node --experimental-strip-types --test ./{rel_path}"
+        else:
+            command = f"node --test ./{rel_path}"
+    elif framework == "go":
+        directory = str(Path(rel_path).parent) or "."
+        preflight = (
+            "command -v go >/dev/null 2>&1 || {\n"
+            f'  echo "the sandbox image {safe_image} has no go" >&2\n'
+            f"  exit {EXIT_RUNNER_MISSING}\n"
+            "}\n"
+        )
+        command = f"go test ./{directory} -run {"Test"}"
+    elif framework == "tsx":
+        preflight = (
+            "command -v npx >/dev/null 2>&1 || {\n"
+            f'  echo "the sandbox image {safe_image} has no npx" >&2\n'
+            f"  exit {EXIT_RUNNER_MISSING}\n"
+            "}\n"
+        )
+        command = f"npx --no-install tsx --test ./{rel_path}"
+    elif framework == "unittest":
         preflight = ""
         command = f"python3 -m unittest -v {target}"
     else:
@@ -485,26 +586,30 @@ class PodmanSandbox:
         cwd = self.view.scratch_parent()
         if not cwd.is_dir():
             cwd = Path.home()
-        try:
-            if self.view.runtime == "docker":
-                # Docker has `image inspect`, not `image exists`.
-                argv = [self.view.runtime, "image", "inspect", self.view.image]
-            else:
-                argv = [self.view.runtime, "image", "exists", self.view.image]
-            run = run_bounded(
-                argv,
-                cwd=cwd,
-                timeout_s=60.0,
-                guard_writes=False,
-            )
-        except FileNotFoundError:
-            return False, f"the {self.view.runtime} binary is not installed"
-        except OSError as exc:
-            return False, f"could not query {self.view.runtime}: {exc}"
-        if run.exit_code != 0:
-            detail = (run.stderr or run.stdout).strip()[:400]
-            return False, f"the sandbox image {self.view.image} is not available locally ({detail})"
-        return True, f"{self.view.runtime} {self.view.image}"
+        images = []
+        for image in (self.view.image, self.view.rust_image, self.view.node_image, self.view.go_image):
+            if image and image not in images:
+                images.append(image)
+        errors: list[str] = []
+        for image in images:
+            try:
+                if self.view.runtime == "docker":
+                    argv = [self.view.runtime, "image", "inspect", image]
+                else:
+                    argv = [self.view.runtime, "image", "exists", image]
+                run = run_bounded(argv, cwd=cwd, timeout_s=60.0, guard_writes=False)
+            except FileNotFoundError:
+                return False, f"the {self.view.runtime} binary is not installed"
+            except OSError as exc:
+                return False, f"could not query {self.view.runtime}: {exc}"
+            if run.exit_code == 0:
+                return True, f"{self.view.runtime} {image}"
+            errors.append(image)
+        return False, (
+            "none of the sandbox images are available locally: "
+            + ", ".join(errors)
+            + "; pull the image for the language you review"
+        )
 
     # -- execution --------------------------------------------------------
     def run_probe(
@@ -516,7 +621,7 @@ class PodmanSandbox:
         timeout_s: float | None = None,
     ) -> ProbeResult:
         started = time.monotonic()
-        image = self.view.image
+        image = self.view.image_for(spec.framework)
         try:
             rel_path = probe_relative_path(spec.test_path)
         except SandboxError as exc:
@@ -592,21 +697,10 @@ class LocalSandbox:
         cwd = self.view.scratch_parent()
         if not cwd.is_dir():
             cwd = Path.home()
-        try:
-            run = run_bounded(
-                [self.python, "-m", "pytest", "--version"],
-                cwd=cwd,
-                timeout_s=60.0,
-                guard_writes=False,
-            )
-        except FileNotFoundError:
-            return False, f"the interpreter {self.python} is not available"
-        except OSError as exc:
-            return False, f"could not query {self.python}: {exc}"
-        if run.exit_code != 0:
-            detail = (run.stderr or run.stdout).strip()[:400]
-            return False, f"pytest is not importable by {self.python} ({detail})"
-        return True, f"local {self.python} (no isolation)"
+        for binary in (self.python, "cargo", "node", "npx"):
+            if shutil.which(binary) is not None:
+                return True, f"local {binary} (no isolation)"
+        return False, "no Python, cargo, node or npx runner is available"
 
     def run_probe(
         self,

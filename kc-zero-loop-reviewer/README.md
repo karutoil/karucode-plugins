@@ -22,8 +22,9 @@ allows 3600 s for hour-scale pull requests):
    the RALE `(AST && CFG) || Code` ensemble. Behavioural hypotheses are generated
    in unit-aware, size-bounded batches; a cross-unit integration pass reviews
    the boundaries between units.
-3. **Execution-grounded probes** — a reproduction test synthesised with up to
-   three Reflexion attempts, executed against the base and head commits in a
+3. **Execution-grounded probes** — a reproduction test in the candidate's
+   language (Python, Rust, JavaScript/TypeScript) synthesised with up to three
+   Reflexion attempts, executed against the base and head commits in a
    network-isolated container. Setup errors are discarded; omissions and
    regressions are retained.
 4. **Falsification** — CIVER (a minimal repair must remove the defect signal,
@@ -96,7 +97,7 @@ long tail below lives in TOML/environment instead.
 | `llm.api_key_env` | `ZERO_LOOP_LLM_API_KEY` | **Name** of the key variable; no secret is stored |
 | `llm.timeout_secs` | `120` | Hard deadline for one model call |
 | `review.deadline_secs` | `240` | Whole-review budget; set `3600` for a huge PR |
-| `review.stage2_timeout_secs` | `60` | One parallel static/ensemble track |
+| `review.stage2_timeout_secs` | `60` | Wall clock for the static/ensemble stage (all three tracks) |
 | `review.max_model_tokens` | `500000` | Context ceiling (tokens) |
 | `review.probe_attempts` | `3` | Reflexion attempts per candidate (1–3) |
 | `review.max_findings` | `0` | `0` = every verified finding up to the ceiling of 50; or an explicit 1–50 cap |
@@ -105,7 +106,7 @@ long tail below lives in TOML/environment instead.
 | `fusion.monitor_temperature` | `0.8` | Deliberately different from the reviewer's deterministic setting |
 | `fusion.disagreement_threshold` | `0.55` | Wider reviewer/monitor gap → human review |
 | `sandbox.runtime` | `podman` | `podman`, `docker`, `local` (dev only), `none` |
-| `sandbox.image` | `docker.io/library/python:3.12-alpine` | Must contain the project runtime |
+| `sandbox.image` | `docker.io/library/python:3.12-alpine` | Python probe image; must contain `pytest`/`unittest` and the project runtime |
 | `sandbox.timeout_secs` | `120` | One base-or-head execution |
 | `sast.semgrep_config` | empty | Empty = the rules shipped in `rules/` |
 | `gate.bot_login` | `zero-loop-reviewer[bot]` | Review identity |
@@ -133,6 +134,7 @@ Set them in `--config` TOML or as `ZERO_LOOP_*`:
 | `fusion.prior_log_odds` / `fusion.clip` | `-0.85` / `12` | Prior and clip on the combined log-odds |
 | `sast.enabled` / `sast.semgrep_bin` / `sast.timeout_secs` | `true` / `semgrep` / `55` | Static track |
 | `sandbox.helper_image` | `docker.io/library/alpine:latest` | Hash/verification helper |
+| `sandbox.rust_image` / `sandbox.node_image` / `sandbox.go_image` | `docker.io/library/rust:1.89-slim` / `docker.io/library/node:22-alpine` / `docker.io/library/golang:1.23-alpine` | Probe images for Rust (`cargo test --offline`), JavaScript/TypeScript (`node --test`, `tsx`) and Go (`go test`) |
 | `sandbox.memory_mb` / `cpus` / `pids_limit` | `1024` / `1.0` / `256` | Container limits |
 | `sandbox.local_fallback` | `false` | Allow `local` mode when no container runtime exists |
 | `gate.authoring_pool_env` / `gate.reviewer_pool_env` | empty / `ZERO_LOOP_LLM_API_KEY` | Pool-disjointness audit |
@@ -166,8 +168,9 @@ the reason `llm_unavailable`, never an approval.
 
 `review_pr` arguments: `base` (required), `head` (default `HEAD`), `workspace`
 (defaults to the session workspace), `expected_head_sha`, `repository` +
-`pull_number`, `description`, `stacked_branches` (branch/SHA pairs that must
-also pass the gate) and `post` (default `false`).
+`pull_number`, `description` (read only by the message/code consistency check),
+`stacked_branches` (branch/SHA pairs that must also pass the gate) and `post`
+(default `false`).
 
 Example (inside a project session):
 
@@ -254,8 +257,9 @@ loopback and put a TLS reverse proxy in front.
 ## Security model
 
 * Probes run with `--network none`, a read-only root, `--cap-drop=ALL`,
-  `no-new-privileges`, memory/PID/CPU limits, and a writable bind of a
-  throw-away copy — never the review worktree.
+  `no-new-privileges`, memory/PID/CPU limits, a writable tmpfs at `/tmp` for the
+  test runner, and a writable bind of a throw-away copy — never the review
+  worktree. The image is chosen by the probe's language.
 * The probe file's SHA-256 is recomputed inside the container before the probe
   runs. A one-byte difference aborts with `input_delivery_failed`.
 * `local` sandbox mode runs probes with the reviewer's own privileges. It is a
@@ -279,11 +283,18 @@ loopback and put a TLS reverse proxy in front.
 
 `./check.sh` runs everything below. On this machine:
 
-* **446 tests pass** in about 67 s (real git 2.47.3, real Semgrep 1.173.0,
+* **457 tests pass** in about 67 s (real git 2.47.3, real Semgrep 1.173.0,
   real podman 5.4.2, a real OpenAI-compatible HTTP fake for the client tests).
 * `python3 eval/run_eval.py` on the annotated corpus: **6/6 buggy cases
   intercepted, 0/4 clean or fix-confirming cases flagged**, in 33.8 s for all
   ten cases.
+* A head-to-head against CodeRabbit on karucode PR #17
+  (`benchmarks/coderabbit/`): CodeRabbit's export holds 11 unique comments, 6 of
+  them on the reviewed head; this reviewer published **0** verified findings at
+  that head. The six are mostly Rust/TypeScript semantic issues, and the
+  executable proof path was Python-only when that snapshot was taken, so the gap
+  is real rather than a parsing accident. Counts are not a quality score: label
+  the unmatched items before drawing a conclusion.
 
 The evaluation runs the deterministic half of the pipeline with *oracle*
 candidate/probe/patch answers from the corpus annotation. It measures
@@ -310,13 +321,17 @@ zero-loop-reviewer review --base origin/main --head HEAD --json --out-dir out
 python3 tools/compare_reviews.py \
   --coderabbit benchmarks/coderabbit/pr17.json \
   --verdict out/review-<id>.json \
+  --head 68fa207f5b4bad10c5e6218c95d247e4205d1d37 \
   --labels labels.json --out comparison.md
 ```
 
-Each unmatched item has an id; the optional labels file marks them
-`{"cr-1": {"valid": true, "note": "real bug"}}` so the report counts what a
-human actually judged valid. `benchmarks/coderabbit/pr17.json` is a saved export
-for that PR.
+`--head` keeps only comments whose `commit_id` starts with that SHA, so a stale
+comment from an earlier push is not counted against the current diff. Each
+unmatched item has an id; the optional labels file marks them
+`{"cr-1": {"valid": true, "note": "real bug"}}` so the report counts what a human
+actually judged valid. `benchmarks/coderabbit/README.md` carries the exact
+`gh api` command for a fresh export and records what the first snapshot showed;
+`benchmarks/coderabbit/pr17-report.md` is its saved report.
 
 ## Using it on the karucode repository
 
@@ -331,8 +346,8 @@ the key is the `ZERO_LOOP_LLM_API_KEY` Actions secret. Fork and Dependabot PRs
 are skipped: GitHub does not give them repository secrets, and falling back to
 `pull_request_target` would expose the key to untrusted code. The job installs
 `rustfmt` and the web `node_modules` so CIVER can syntax-check Rust and
-TypeScript repairs, pulls the probe image, and runs with a 3600 s review budget
-and a 75-minute job timeout.
+TypeScript repairs, pulls the three probe images, and runs with a 3600 s review
+budget and a 75-minute job timeout.
 
 The shipped rule packs cover Python, Rust, TypeScript/JavaScript and GitHub
 Actions YAML. CIVER parses the repaired file with `compileall`, `rustfmt`,
@@ -342,6 +357,32 @@ approves with no comments; that is the intended result, not a failure to run.
 Pullfrog and CodeRabbit can comment on a clean YAML diff because they publish
 ungrounded LLM opinions; this reviewer only comments on a mechanically verified
 finding or reports `human_review`.
+
+## Languages
+
+Static coverage: Python, Rust, TypeScript/JavaScript and GitHub Actions rule
+packs, plus the generic Semgrep pass. CIVER syntax-checks Rust with `rustfmt`,
+JavaScript/TypeScript with node/esbuild and Python with its parser.
+
+Executable probes now dispatch by language:
+
+| Candidate | Probe | Framework | Image |
+| --- | --- | --- | --- |
+| Python | pytest/unittest | `pytest`/`unittest` | `sandbox.image` |
+| Rust | `tests/*.rs` integration test | `cargo` | `sandbox.rust_image` |
+| TypeScript | `node:test` file | `node`/`tsx` | `sandbox.node_image` |
+| JavaScript | `node:test` file | `node` | `sandbox.node_image` |
+| Go | `*_test.go` file | `go` | `sandbox.go_image` |
+
+The probe prompt is language-specific, the host validates the test path and
+framework, and the sandbox picks the matching image. Rust runs
+`cargo test --offline` against `<crate>/Cargo.toml` with the target directory on
+a writable tmpfs, so the image (or the copied worktree) must carry the crate
+registry for an offline build. JavaScript/TypeScript runs `node --test`
+(`--experimental-strip-types` for `.ts`, or `npx --no-install tsx` when that
+framework is chosen) and needs the project's `node_modules` in the scratch copy.
+Missing toolchains, dependencies or images are **setup errors**, not evidence
+against the PR.
 
 ## Large PRs
 
@@ -406,12 +447,12 @@ reviewed in a few minutes.
 
 ### Coverage, not recall
 
-Every production changed line must be assigned to a behavioural batch; a missing
-assignment is recorded as `behavioral_hunk_coverage_incomplete` and stops an
-approval. The full enclosing function of each changed site is added to the
-context, not just the diff hunk and its 1-hop signatures. When more anchored
-hypotheses exist than the candidate cap allows, the excess is recorded as
-`behavioral_candidate_coverage_incomplete`.
+Every changed line of a production source file must be assigned to a behavioural
+batch; a missing assignment is recorded as
+`behavioral_hunk_coverage_incomplete` and stops an approval. The full enclosing
+function of each changed site is added to the context, not just the diff hunk and
+its 1-hop signatures. When more anchored hypotheses exist than the candidate cap
+allows, the excess is recorded as `behavioral_candidate_coverage_incomplete`.
 
 Coverage is allowed to be *incomplete*, never silently green. A truncated diff
 or context, a capped batch scan, or a probe/CIVER cap adds a blind spot; if no
@@ -421,6 +462,13 @@ verified finding still produces `request_changes` and a committable suggestion.
 `review.exhaustive` (default `true`) raises the batch cap from 24 to 100 and the
 hypothesis cap from 24 to 100. It does not change the coverage rules above,
 which always apply.
+
+Analyzer findings are suppressed before they can become candidates when they sit
+on a configured suppression path (`tests/`, `test/`, `vendor/`, `third_party/`),
+inside test code, on a line carrying `nosec` / `semgrep-ignore` /
+`zero-loop:ignore`, or — for an injection CWE — on a line where a configured
+trusted sanitizer is applied. Test files are still reviewed behaviourally;
+coverage simply does not require their lines.
 
 This is a **coverage** guarantee, not a recall guarantee. On the 9.6k-line PR #17
 it covered all **6,492 production changed lines** with zero missing assignments
@@ -442,11 +490,15 @@ candidate cannot be verified it fails open to `human_review` with a receipt.
 
 ## Known limits
 
-* Probe execution is Python-only. Rust, TypeScript/JavaScript and GitHub Actions
-  have patch-caused Semgrep rule packs and language-aware CIVER syntax checks,
-  but there is no Rust/TS probe runner; a Rust/TS logic bug with no matching rule
-  still ends in `human_review`, never a public comment. The RALE ensemble and
-  ObliVul's measured counterfactuals are Python-only as well.
+* The executable probe path dispatches by language: Python (pytest/unittest),
+  Rust (a `tests/*.rs` integration test run with `cargo test --offline`) and
+  JavaScript/TypeScript (`node --test`, or `tsx`). A Rust probe is always an
+  integration test, so a defect that is only reachable through private internals
+  cannot be reproduced; a missing toolchain, image or dependency is a setup
+  error, which leaves the candidate unverified instead of publishing it. The
+  RALE ensemble and ObliVul's risk counter remain Python-only:
+  `rules/lsog_risk.py` parses the file with Python's `ast`, so a non-Python site
+  cannot be ObliVul-verified.
 * A finding needs a probe or an analyzer rerun to be emitted. A real defect
   whose reproduction cannot be synthesised becomes **human review**, not a
   public finding. That is deliberate: the zero-loop contract forbids an

@@ -366,6 +366,9 @@ class FusionConfig:
 class SandboxConfig:
     runtime: str = "podman"  # podman | docker | local | none
     image: str = "docker.io/library/python:3.12-alpine"
+    rust_image: str = "docker.io/library/rust:1.89-slim"
+    node_image: str = "docker.io/library/node:22-alpine"
+    go_image: str = "docker.io/library/golang:1.23-alpine"
     helper_image: str = "docker.io/library/alpine:latest"
     timeout_s: float = 120.0
     memory_mb: int = 1024
@@ -615,6 +618,9 @@ def _merged(settings: Mapping[str, Any], environ: Mapping[str, str], file_values
         "gate.authoring_pool_env",
         "gate.reviewer_pool_env",
         "sandbox.helper_image",
+        "sandbox.rust_image",
+        "sandbox.node_image",
+        "sandbox.go_image",
         "sandbox.memory_mb",
         "sandbox.cpus",
         "sandbox.pids_limit",
@@ -749,6 +755,9 @@ def load_settings(
     sandbox = SandboxConfig(
         runtime=str(get("sandbox.runtime", "podman")),
         image=str(get("sandbox.image", "docker.io/library/python:3.12-alpine")),
+        rust_image=str(get("sandbox.rust_image", "docker.io/library/rust:1.89-slim")),
+        node_image=str(get("sandbox.node_image", "docker.io/library/node:22-alpine")),
+        go_image=str(get("sandbox.go_image", "docker.io/library/golang:1.23-alpine")),
         helper_image=str(get("sandbox.helper_image", "docker.io/library/alpine:latest")),
         timeout_s=float(get("sandbox.timeout_secs", 120)),
         memory_mb=int(get("sandbox.memory_mb", 1024)),

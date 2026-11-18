@@ -488,3 +488,40 @@ def test_real_podman_runs_a_probe_on_an_image_without_pytest(tmp_path):
     finally:
         repo.remove_worktree(tree)
         shutil.rmtree(state, ignore_errors=True)
+
+
+def test_probe_paths_accept_rust_and_typescript() -> None:
+    assert probe_relative_path("tests/zl_probe.rs") == "tests/zl_probe.rs"
+    assert probe_relative_path("web/src/probe.test.ts") == "web/src/probe.test.ts"
+    assert probe_relative_path("src/probe.js") == "src/probe.js"
+
+
+def test_rust_probe_must_live_under_tests() -> None:
+    from zero_loop_reviewer.errors import SandboxError
+
+    try:
+        probe_relative_path("crates/foo/src/probe.rs")
+    except SandboxError as exc:
+        assert "tests/" in str(exc)
+    else:
+        raise AssertionError("expected a non-tests Rust path to be refused")
+
+
+def test_cargo_and_node_scripts_use_the_language_runner() -> None:
+    cargo = probe_script("tests/zl_probe.rs", "a" * 64, framework="cargo", image="rust:1")
+    assert "cargo test --offline --test zl_probe" in cargo
+    assert "CARGO_TARGET_DIR" in cargo
+    node = probe_script("web/src/probe.test.ts", "b" * 64, framework="node", image="node:22")
+    assert "node --experimental-strip-types --test" in node
+    js = probe_script("web/src/probe.test.mjs", "c" * 64, framework="node", image="node:22")
+    assert "node --test" in js
+
+
+def test_go_probe_path_and_image() -> None:
+    assert probe_relative_path("calc/calc_test.go") == "calc/calc_test.go"
+    from zero_loop_reviewer.stage3.sandbox import SandboxConfigView
+
+    view = SandboxConfigView()
+    assert view.image_for("go").endswith("golang:1.23-alpine")
+    script = probe_script("calc/calc_test.go", "d" * 64, framework="go", image="go:1")
+    assert "go test ./calc -run Test" in script

@@ -203,3 +203,67 @@ def test_inspect_probe_reports_every_problem_at_once():
 def test_assertion_and_boundary_detectors(content, assertion, boundary):
     assert has_assertion(content) is assertion
     assert has_boundary(content) is boundary
+
+
+RUST_PROBE = '''
+#[test]
+fn empty_input_is_handled() {
+    let values: Vec<i32> = vec![];
+    assert_eq!(values.len(), 0);
+}
+'''
+
+TS_PROBE = '''
+import test from 'node:test';
+import assert from 'node:assert';
+test('empty input', () => {
+  assert.deepEqual([], []);
+});
+'''
+
+
+def test_inspect_probe_accepts_rust_and_typescript_probes() -> None:
+    rust = inspect_probe(
+        ProbeSpec(test_path="tests/zl_probe.rs", content=RUST_PROBE, framework="cargo"),
+        language="rust",
+    )
+    assert rust == []
+    ts = inspect_probe(
+        ProbeSpec(test_path="web/src/probe.test.ts", content=TS_PROBE, framework="node"),
+        language="typescript",
+    )
+    assert ts == []
+
+
+def test_inspect_probe_rejects_wrong_framework_and_non_tests_rust_path() -> None:
+    rust = inspect_probe(
+        ProbeSpec(test_path="src/probe.rs", content=RUST_PROBE, framework="pytest"),
+        language="rust",
+    )
+    assert any("tests/*.rs" in issue for issue in rust)
+    assert any("framework='cargo'" in issue for issue in rust)
+
+
+GO_PROBE = '''
+package calc
+
+import "testing"
+
+func TestEmptyAndSum(t *testing.T) {
+    empty := []int{}
+    if len(empty) != 0 {
+        t.Fatalf("bad empty")
+    }
+    if Add(2, 3) != 5 {
+        t.Fatalf("Add(2, 3) = %d, want 5", Add(2, 3))
+    }
+}
+'''
+
+
+def test_inspect_probe_accepts_a_go_probe() -> None:
+    issues = inspect_probe(
+        ProbeSpec(test_path="calc/calc_test.go", content=GO_PROBE, framework="go"),
+        language="go",
+    )
+    assert issues == []
