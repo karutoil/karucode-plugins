@@ -1,0 +1,93 @@
+# Rules shipped with zero-loop-reviewer (Stage 2A) — JavaScript / TypeScript.
+#
+# Patch-caused only: these fire on a line the PR added.  A repair must still
+# survive CIVER's check (the rule disappears, esbuild parses the patched file,
+# and a whitespace no-op does not remove the signal).
+rules:
+  - id: zero-loop.js-eval
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      eval/new Function executes a string as code; any request-derived value is
+      code injection (CWE-95).
+    metadata:
+      category: security
+      confidence: HIGH
+      cwe: "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')"
+      zero_loop_track: taint
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: new Function(...)
+
+  - id: zero-loop.js-inner-html
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      Assigning HTML from a non-literal value is an XSS sink; use textContent or
+      a sanitizer (CWE-79).
+    metadata:
+      category: security
+      confidence: HIGH
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
+      zero_loop_track: taint
+    pattern-either:
+      - pattern: $EL.innerHTML = $VALUE
+      - pattern: $EL.outerHTML = $VALUE
+
+  - id: zero-loop.js-react-dangerous-html
+    languages: [typescript, javascript]
+    severity: ERROR
+    message: >-
+      dangerouslySetInnerHTML bypasses React's escaping; sanitize the HTML or
+      render text (CWE-79).
+    metadata:
+      category: security
+      confidence: HIGH
+      cwe: "CWE-79: Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"
+      zero_loop_track: taint
+    pattern: dangerouslySetInnerHTML={...}
+
+  - id: zero-loop.js-wildcard-postmessage
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      postMessage with "*" delivers data to any origin.  Name the intended
+      origin explicitly (CWE-346).
+    metadata:
+      category: security
+      confidence: HIGH
+      cwe: "CWE-346: Origin Validation Error"
+      zero_loop_track: taint
+    pattern: $TARGET.postMessage($MESSAGE, "*")
+
+  - id: zero-loop.js-command-exec
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      exec/execSync runs a shell command; interpolated input is command
+      injection (CWE-78).  Use execFile/spawn with an argument vector.
+    metadata:
+      category: security
+      confidence: HIGH
+      cwe: "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
+      zero_loop_track: taint
+    pattern-either:
+      - pattern: child_process.exec(...)
+      - pattern: child_process.execSync(...)
+      - pattern: require("child_process").exec(...)
+
+  - id: zero-loop.js-weak-hash
+    languages: [javascript, typescript]
+    severity: WARNING
+    message: >-
+      MD5/SHA-1 are not collision resistant for security decisions (CWE-328).
+    metadata:
+      category: security
+      confidence: HIGH
+      cwe: "CWE-328: Use of Weak Hash"
+      zero_loop_track: pattern
+    pattern-either:
+      - pattern: crypto.createHash("md5")
+      - pattern: crypto.createHash("sha1")
+      - pattern: createHash("md5")
+      - pattern: createHash("sha1")

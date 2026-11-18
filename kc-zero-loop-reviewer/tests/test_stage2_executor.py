@@ -16,7 +16,7 @@ from zero_loop_reviewer.models import ContextSlice, FindingStatus, SecSemScan, S
 from zero_loop_reviewer.stage2.executor import Stage2Outcome, run_stage2
 from zero_loop_reviewer.stage2.sast import DEFAULT_RULES
 
-HAVE_SEMGREP = shutil.which("semgrep") is not None and DEFAULT_RULES.is_file()
+HAVE_SEMGREP = shutil.which("semgrep") is not None and DEFAULT_RULES.is_dir()
 requires_semgrep = pytest.mark.skipif(not HAVE_SEMGREP, reason="semgrep is not installed; executor tests are skipped")
 
 BASE_FILE = "def f(v):\n    return v\n"

@@ -1,0 +1,79 @@
+# Rules shipped with zero-loop-reviewer (Stage 2A) — Rust.
+#
+# These are deliberately narrow, patch-caused signals.  They do not replace a
+# project's clippy configuration; they catch the shapes that most often turn a
+# PR's new line into a panic, an unchecked command or an unsound block.  A
+# repair is still posted only after CIVER shows the rule disappears and the
+# patched file parses with rustfmt.
+rules:
+  - id: zero-loop.rust-unwrap
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      A new unwrap() turns an Option/Result into a panic path.  At a trust
+      boundary this is remotely triggerable (CWE-248); prefer `?`, a typed
+      error, or an explicit fallback.
+    metadata:
+      category: reliability
+      confidence: HIGH
+      cwe: "CWE-248: Uncaught Exception"
+      zero_loop_track: pattern
+    pattern: $VALUE.unwrap()
+
+  - id: zero-loop.rust-expect
+    languages: [rust]
+    severity: WARNING
+    message: >-
+      A new expect() is a panic with a message.  If the value comes from a
+      request, file or socket, return an error instead.
+    metadata:
+      category: reliability
+      confidence: MEDIUM
+      cwe: "CWE-248: Uncaught Exception"
+      zero_loop_track: pattern
+    pattern: $VALUE.expect(...)
+
+  - id: zero-loop.rust-unimplemented
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      todo!/unimplemented! reachable from production code panics at runtime.
+    metadata:
+      category: correctness
+      confidence: HIGH
+      cwe: "CWE-248: Uncaught Exception"
+      zero_loop_track: pattern
+    pattern-either:
+      - pattern: todo!(...)
+      - pattern: unimplemented!(...)
+
+  - id: zero-loop.rust-unsafe-block
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      A new unsafe block bypasses the compiler's memory-safety checks.  Require
+      a safety comment and a demonstrated invariant before merging it.
+    metadata:
+      category: security
+      confidence: MEDIUM
+      cwe: "CWE-119: Improper Restriction of Operations within the Bounds of a Memory Buffer"
+      zero_loop_track: pattern
+    pattern: unsafe { ... }
+
+  - id: zero-loop.rust-shell-command
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      A shell is invoked with Command; interpolated input becomes command
+      injection (CWE-78).  Pass an argument vector instead of `sh -c`.
+    metadata:
+      category: security
+      confidence: HIGH
+      cwe: "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
+      zero_loop_track: taint
+    patterns:
+      - pattern-either:
+          - pattern: std::process::Command::new("sh")
+          - pattern: std::process::Command::new("bash")
+          - pattern: Command::new("sh")
+          - pattern: Command::new("bash")

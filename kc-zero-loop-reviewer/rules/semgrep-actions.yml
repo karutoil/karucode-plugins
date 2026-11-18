@@ -1,0 +1,49 @@
+# Rules shipped with zero-loop-reviewer (Stage 2A) — GitHub Actions YAML.
+#
+# This repository's CI is a security boundary: a workflow runs with a
+# repository token.  These rules only fire on added lines, so an existing
+# baseline is not re-litigated on every PR.
+rules:
+  - id: zero-loop.actions-unpinned-action
+    languages: [yaml]
+    severity: WARNING
+    message: >-
+      A third-party action referenced by a mutable tag can change under the
+      repository.  Pin it to a full commit SHA (CWE-829).
+    metadata:
+      category: supply-chain
+      confidence: HIGH
+      cwe: "CWE-829: Inclusion of Functionality from Untrusted Control Sphere"
+      zero_loop_track: pattern
+    patterns:
+      - pattern: "uses: $ACTION"
+      - metavariable-regex:
+          metavariable: $ACTION
+          regex: ^(?!\./)[^@\s]+@(?:v?\d+|main|master|latest)$
+
+  - id: zero-loop.actions-write-all
+    languages: [yaml]
+    severity: ERROR
+    message: >-
+      `permissions: write-all` gives a workflow (and any action it runs) write
+      access to every scope.  Grant the minimum scopes instead.
+    metadata:
+      category: security
+      confidence: HIGH
+      cwe: "CWE-269: Improper Privilege Management"
+      zero_loop_track: pattern
+    pattern: "permissions: write-all"
+
+  - id: zero-loop.actions-pull-request-target
+    languages: [yaml]
+    severity: ERROR
+    message: >-
+      pull_request_target runs with repository secrets against untrusted PR
+      code.  Use `pull_request`, or never check out and execute the PR head in
+      this workflow.
+    metadata:
+      category: security
+      confidence: HIGH
+      cwe: "CWE-269: Improper Privilege Management"
+      zero_loop_track: pattern
+    pattern: pull_request_target

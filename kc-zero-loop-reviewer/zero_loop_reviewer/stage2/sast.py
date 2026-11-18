@@ -26,7 +26,7 @@ from ..models import AnalyzerFinding, AttemptStatus, DiffBundle, sha256_hex
 from ..stage1.contract import run_bounded
 
 #: Rules shipped with the plugin, relative to the package root.
-DEFAULT_RULES = Path(__file__).resolve().parents[2] / "rules" / "semgrep-python.yml"
+DEFAULT_RULES = Path(__file__).resolve().parents[2] / "rules"
 
 _SEVERITY = {"ERROR": 3, "WARNING": 2, "INFO": 1}
 _CWE = re.compile(r"CWE-\d+")
@@ -147,7 +147,7 @@ def run_semgrep(
 def _config_value(config: SastConfig) -> str:
     text = (config.semgrep_config or "").strip()
     if not text:
-        if not DEFAULT_RULES.is_file():
+        if not DEFAULT_RULES.is_dir():
             raise ToolError(f"the shipped Semgrep rules are missing: {DEFAULT_RULES}")
         return str(DEFAULT_RULES)
     looks_like_path = text.endswith((".yml", ".yaml")) or os.sep in text

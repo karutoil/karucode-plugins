@@ -153,6 +153,7 @@ def verify_fix(
     defect_probe: Scan | None = None,
     analyzer_rerun: Scan | None = None,
     linter: Sequence[str] | None = None,
+    tool_root: Path | None = None,
 ) -> CiverResult:
     """Run every check on scratch copies; store a ``Fix`` only if all pass.
 
@@ -204,13 +205,21 @@ def verify_fix(
             return _fail(rejected, checks)
         checks.append("patch_applies: git apply --check")
 
-        compiled = _command(runner, list(_COMPILE_ARGV), patched, settings)
-        if not _succeeded(compiled):
-            return _fail(
-                f"compile_failed: {' '.join(_COMPILE_ARGV)} exited {compiled.exit_code}: {_tail(compiled)}",
-                checks,
-            )
-        checks.append("compile_ok: " + " ".join(_COMPILE_ARGV))
+        syntax_commands, unavailable = _syntax_commands(
+            _patch_paths(proposal.patch), patched, tool_root
+        )
+        if unavailable:
+            return _fail(f"syntax_checker_unavailable: {unavailable}", checks)
+        if not syntax_commands:
+            checks.append("syntax_check_skipped: no recognized source file in the patch")
+        for label, argv in syntax_commands:
+            checked = _command(runner, argv, patched, settings)
+            if not _succeeded(checked):
+                return _fail(
+                    f"{label}_failed: {' '.join(argv)} exited {checked.exit_code}: {_tail(checked)}",
+                    checks,
+                )
+            checks.append(f"{label}_ok: " + " ".join(argv))
 
         lint_ok = False
         command = _linter_argv(linter, settings)
@@ -378,14 +387,27 @@ def _apply_patch(
             tree,
             settings,
         )
+        zero_context = False
         if not _succeeded(check):
-            return f"patch_rejected: git apply --check exited {check.exit_code}: {_tail(check)}"
-        applied = _command(
-            runner,
-            ["git", "apply", "--whitespace=nowarn", str(patch_file)],
-            tree,
-            settings,
-        )
+            # Model-authored diffs often omit the final context line.  Git
+            # rejects that hunk even though it applies exactly at the recorded
+            # line; ask Git for the zero-context interpretation instead of
+            # discarding an otherwise valid repair.  The compile/analyzer/no-op
+            # checks still decide whether the change is acceptable.
+            check = _command(
+                runner,
+                ["git", "apply", "--check", "--unidiff-zero", "--whitespace=nowarn", str(patch_file)],
+                tree,
+                settings,
+            )
+            zero_context = True
+            if not _succeeded(check):
+                return f"patch_rejected: git apply --check exited {check.exit_code}: {_tail(check)}"
+        apply_args = ["git", "apply", "--whitespace=nowarn"]
+        if zero_context:
+            apply_args.append("--unidiff-zero")
+        apply_args.append(str(patch_file))
+        applied = _command(runner, apply_args, tree, settings)
         if not _succeeded(applied):
             return f"patch_rejected: git apply exited {applied.exit_code}: {_tail(applied)}"
         return ""
@@ -415,6 +437,73 @@ def _linter_argv(linter: Sequence[str] | None, settings: Settings) -> list[str]:
         return []
     # A linter is run over the tree root; no write-enabling flag is ever added.
     return [*command, "."]
+
+
+def _syntax_commands(
+    files: Sequence[str], tree: Path, tool_root: Path | None
+) -> tuple[list[tuple[str, list[str]]], str]:
+    """Language-aware parse checks for the *patched* tree.
+
+    A Python-only ``compileall`` silently succeeded for every Rust or TypeScript
+    repair.  These commands are parse/compile checks, not the project's full
+    type-checker: they catch a malformed one-click suggestion before it is
+    published.  A missing checker fails closed.
+    """
+    existing = [
+        path
+        for path in files
+        if not path.startswith("/") and ".." not in Path(path).parts and (tree / path).is_file()
+    ]
+    commands: list[tuple[str, list[str]]] = []
+    python = [path for path in existing if path.endswith((".py", ".pyi"))]
+    rust = [path for path in existing if path.endswith(".rs")]
+    javascript = [path for path in existing if path.endswith((".js", ".mjs", ".cjs"))]
+    ts = [path for path in existing if path.endswith((".ts", ".tsx", ".jsx"))]
+    if python:
+        commands.append(("compile", ["python3", "-m", "compileall", "-q", *python]))
+    for path in rust:
+        commands.append(("syntax", ["rustfmt", "--emit", "stdout", "--quiet", path]))
+    for path in javascript:
+        commands.append(("syntax", ["node", "--check", path]))
+    if ts:
+        esbuild = _find_esbuild(tool_root)
+        if esbuild is None:
+            return [], (
+                "a TypeScript/TSX repair needs esbuild for a parse check and no "
+                "node_modules/.bin/esbuild was found; install the web dependencies "
+                "or leave the finding unverified"
+            )
+        for path in ts:
+            loader = "tsx" if path.endswith(".tsx") else ("jsx" if path.endswith(".jsx") else "ts")
+            commands.append(
+                (
+                    "syntax",
+                    [
+                        esbuild,
+                        path,
+                        f"--loader:.{loader}={loader}",
+                        "--outfile=/dev/null",
+                        "--log-level=error",
+                    ],
+                )
+            )
+    return commands, ""
+
+
+def _find_esbuild(tool_root: Path | None) -> str | None:
+    candidates: list[Path] = []
+    if tool_root is not None:
+        root = Path(tool_root)
+        candidates.extend(
+            [
+                root / "web" / "node_modules" / ".bin" / "esbuild",
+                root / "node_modules" / ".bin" / "esbuild",
+            ]
+        )
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which("esbuild")
 
 
 def _patch_paths(patch: str) -> list[str]:

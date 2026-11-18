@@ -589,6 +589,15 @@ class Reviewer:
             if not ok or budget.remaining() < 20.0:
                 updated.append(candidate)
                 continue
+            if not _probe_supported(candidate):
+                updated.append(candidate)
+                self._record(
+                    "3.probe",
+                    AttemptStatus.SKIPPED,
+                    _now(),
+                    f"{candidate.id}: no probe framework for {candidate.cited_sites[0].path if candidate.cited_sites else 'the cited site'}",
+                )
+                continue
             started = _now()
             try:
                 result, new_pairs, degraded = cascade_mod.run_cascade(
@@ -637,6 +646,12 @@ class Reviewer:
         for candidate in list(updated):
             if candidate.status is not FindingStatus.UNVERIFIED or budget.remaining() < 15.0:
                 continue
+            # Rule-backed candidates are verified by CIVER's analyzer rerun;
+            # a 5-vote LLM fallback adds no mechanical evidence for them.  The
+            # fallback is only for probe-capable candidates whose probe did not
+            # produce a usable pair.
+            if not _probe_supported(candidate):
+                continue
             pair = candidate.verification.probe
             if (
                 pair is not None
@@ -681,6 +696,10 @@ class Reviewer:
         work_root = self.settings.paths.work_dir
         budget_settings = replace(self.settings, deadline_s=max(5.0, budget.remaining()))
         frames = {frame.path: frame for frame in (run.stage2.frames if run.stage2 else [])}
+        rule_tracks = {
+            finding.rule_id: finding.track
+            for finding in (run.stage2.findings if run.stage2 else [])
+        }
         head_tree: Path | None = None
         out: list[Candidate] = []
         try:
@@ -721,7 +740,21 @@ class Reviewer:
                 )
 
                 # Stage 4B: bidirectional LSOG check for static/resource alerts.
-                if not probe_capable and (candidate.cwe or candidate.evidence.kind == "analyzer") and budget.remaining() > 25.0:
+                # A pattern rule such as Rust's `unwrap()` is not a taint or
+                # lifetime obligation, so ObliVul cannot express it; its CIVER
+                # analyzer rerun is the right falsifier.  Suppressing here would
+                # discard every non-Python rule finding.
+                track = rule_tracks.get(candidate.evidence.rule_id, "")
+                oblivul_applies = track in ("taint", "lifetime") or (
+                    not candidate.evidence.rule_id
+                    and candidate.evidence.kind != "analyzer"
+                    and bool(candidate.cwe)
+                )
+                if (
+                    not probe_capable
+                    and oblivul_applies
+                    and budget.remaining() > 25.0
+                ):
                     started = _now()
                     try:
                         frame = frames.get(candidate.cited_sites[0].path if candidate.cited_sites else "")
@@ -875,6 +908,7 @@ class Reviewer:
                 defect_probe=defect_probe,
                 analyzer_rerun=analyzer_rerun,
                 linter=None,
+                tool_root=repo.root,
             )
             self._record(
                 "4.civer.verify",
@@ -938,6 +972,28 @@ class Reviewer:
         eligible = [c for c in candidates if c.status is not FindingStatus.SUPPRESSED]
         eligible.sort(key=lambda c: (-_severity(c.severity), c.id))
         chosen = eligible[:5]
+        # Unverified hypotheses are never published, so fusing them cannot make
+        # them publishable; it only burns five monitor calls per hypothesis on
+        # every clean PR.  Only mechanically verified candidates reach Stage 5.
+        verified_chosen = [c for c in chosen if c.status is FindingStatus.VERIFIED]
+        mechanically_confirmed = any(
+            candidate.status is FindingStatus.VERIFIED
+            and candidate.verified_fix is not None
+            and candidate.verification.kind
+            in (
+                VerificationKind.PROBE,
+                VerificationKind.PERTURBATION,
+                VerificationKind.CPG_COUNTERFACTUAL,
+                VerificationKind.ANALYZER_TRACE,
+            )
+            for candidate in candidates
+        )
+        if force_human:
+            run.degraded.append("fusion_skipped: the review was forced to human review")
+        elif not verified_chosen:
+            run.degraded.append(
+                "fusion_skipped: no mechanically verified candidate; unverified hypotheses are not published"
+            )
         elicitations: dict[str, RiskElicitation] = {}
         monitors: dict[str, MonitorScore] = {}
 
@@ -957,11 +1013,11 @@ class Reviewer:
                     reasons.append(f"monitor: {why}")
             return candidate.id, elicitation, monitor, "; ".join(reasons)
 
-        if chosen and not force_human and budget.remaining() > 15.0:
+        if verified_chosen and not force_human and budget.remaining() > 15.0:
             self._cap_llm(budget)
-            workers = min(4, len(chosen))
+            workers = min(4, len(verified_chosen))
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = [pool.submit(fuse_one, candidate) for candidate in chosen]
+                futures = [pool.submit(fuse_one, candidate) for candidate in verified_chosen]
                 for future in futures:
                     try:
                         cid, elicitation, monitor, why = future.result()
@@ -976,7 +1032,7 @@ class Reviewer:
                         run.degraded.append(f"fusion_degraded: {cid}: {why}")
 
         fused: dict[str, FusionResult] = {}
-        for candidate in chosen:
+        for candidate in verified_chosen:
             elicitation = elicitations.get(candidate.id)
             monitor = monitors.get(candidate.id)
             if elicitation is None or monitor is None:
@@ -987,28 +1043,62 @@ class Reviewer:
             candidate.monitor = monitor
             candidate.p_combined = result.p_combined
 
-        mechanically_confirmed = any(
-            candidate.status is FindingStatus.VERIFIED
-            and candidate.verified_fix is not None
-            and candidate.verification.kind
-            in (
-                VerificationKind.PROBE,
-                VerificationKind.PERTURBATION,
-                VerificationKind.CPG_COUNTERFACTUAL,
-                VerificationKind.ANALYZER_TRACE,
+        if force_human:
+            decision, p_worst, reasons = Decision.HUMAN_REVIEW, 0.0, []
+        elif verified_chosen:
+            decision, p_worst, reasons = fusion_mod.decide(
+                verified_chosen,
+                elicitations,
+                monitors,
+                self.settings.fusion,
+                mechanically_confirmed=mechanically_confirmed,
             )
-            for candidate in candidates
-        )
-        decision, p_worst, reasons = fusion_mod.decide(
-            chosen, elicitations, monitors, self.settings.fusion, mechanically_confirmed=mechanically_confirmed
-        )
-        run.degraded.extend(f"decision: {reason}" for reason in reasons if "disagree" in reason or "unfusable" in reason)
+            run.degraded.extend(
+                f"decision: {reason}" for reason in reasons if "disagree" in reason or "unfusable" in reason
+            )
+        else:
+            severe_unverified = any(
+                candidate.status is FindingStatus.UNVERIFIED and _severity(candidate.severity) >= 2
+                for candidate in candidates
+            )
+            decision = Decision.HUMAN_REVIEW if severe_unverified else Decision.APPROVE
+            p_worst = 1.0 if severe_unverified else 0.0
+            reasons = []
 
         # Mark exploitable security findings before selection: a redacted flag
         # is the one published shape that may omit a committable patch.
         candidates = [_mark_exploitable(candidate, self.settings) for candidate in candidates]
 
         already_suppressed = [c for c in candidates if c.status is FindingStatus.SUPPRESSED]
+        # Two stages can reach the same repair (a rule finding and a semantic
+        # monologue on the same line).  Publish one comment, not a duplicate.
+        seen_fixes: dict[str, str] = {}
+        deduped: list[Candidate] = []
+        duplicate_suppressed: list[Candidate] = []
+        for candidate in candidates:
+            if candidate.status is not FindingStatus.VERIFIED:
+                deduped.append(candidate)
+                continue
+            key = (
+                "suggestion:" + formatter_mod.suggestion_block(candidate.verified_fix)
+                if candidate.verified_fix is not None
+                else "redacted:" + "|".join(f"{s.path}:{s.line}" for s in candidate.cited_sites[:1])
+            )
+            if key in seen_fixes:
+                duplicate_suppressed.append(
+                    candidate.model_copy(
+                        update={
+                            "status": FindingStatus.SUPPRESSED,
+                            "suppression_reason": f"duplicate_of: {seen_fixes[key]}",
+                        }
+                    )
+                )
+                run.degraded.append(f"duplicate_suppressed: {candidate.id} duplicates {seen_fixes[key]}")
+                continue
+            seen_fixes[key] = candidate.id
+            deduped.append(candidate)
+        candidates = deduped
+        already_suppressed = [*already_suppressed, *duplicate_suppressed]
         selected, suppressed = formatter_mod.select_with_receipts(
             [c for c in candidates if c.status in (FindingStatus.VERIFIED, FindingStatus.UNVERIFIED)],
             self.settings.max_findings,
@@ -1068,7 +1158,7 @@ class Reviewer:
             and candidate.verified_fix is None
             and not formatter_mod.is_redacted_flag(candidate)
             for candidate in candidates
-        ):
+        ) and not published:
             decision = Decision.HUMAN_REVIEW
             run.degraded.append(
                 "unexpressible_verified_finding: a verified defect has no committable suggestion, "
@@ -1077,7 +1167,7 @@ class Reviewer:
         elif any(
             candidate.status is FindingStatus.UNVERIFIED and _severity(candidate.severity) >= 2
             for candidate in candidates
-        ):
+        ) and not published:
             decision = Decision.HUMAN_REVIEW
             run.degraded.append("unverified_candidates: at least one severe candidate could not be mechanically verified")
 
@@ -1259,6 +1349,19 @@ def _site_in_diff(diff: DiffBundle, site: CitedSite) -> bool:
     if not changed:
         return False
     return any(abs(site.line - line) <= 2 for line in changed)
+
+
+def _probe_supported(candidate: Candidate) -> bool:
+    """Probe synthesis currently emits Python tests only.
+
+    Running a Python probe against a Rust or TypeScript tree produces a
+    ``BOTH_FAIL`` classification that is an environment artefact, not an
+    omission defect.  Those candidates must go through an analyzer rerun in
+    CIVER instead.
+    """
+    if not candidate.cited_sites:
+        return False
+    return candidate.cited_sites[0].path.endswith((".py", ".pyi"))
 
 
 def _groundable(site: CitedSite, findings: Sequence[AnalyzerFinding]) -> bool:

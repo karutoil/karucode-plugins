@@ -265,3 +265,53 @@ def test_verify_fix_skips_an_uninstalled_linter_but_refuses_a_failing_one(checko
     assert failed.passed is False
     assert failed.fix is None
     assert "lint_failed" in failed.detail
+
+
+def test_syntax_commands_cover_python_and_rust(tmp_path) -> None:
+    from zero_loop_reviewer.stage4.civer import _syntax_commands
+
+    (tmp_path / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "a.rs").write_text("pub fn f() {}\n", encoding="utf-8")
+    commands, unavailable = _syntax_commands(["a.py", "a.rs"], tmp_path, None)
+    rendered = " ".join(" ".join(argv) for _label, argv in commands)
+    assert unavailable == ""
+    assert "compileall" in rendered
+    assert "rustfmt" in rendered
+
+
+def test_a_missing_typescript_checker_fails_closed(tmp_path) -> None:
+    from zero_loop_reviewer.stage4.civer import _find_esbuild, _syntax_commands
+
+    if _find_esbuild(None) is not None:
+        return
+    (tmp_path / "a.ts").write_text("export const x: number = 1;\n", encoding="utf-8")
+    commands, unavailable = _syntax_commands(["a.ts"], tmp_path, None)
+    assert commands == []
+    assert "esbuild" in unavailable
+
+
+def test_a_minimal_model_patch_without_trailing_context_applies(tmp_path) -> None:
+    from zero_loop_reviewer.stage4.civer import _apply_patch
+
+    tree = tmp_path / "tree"
+    (tree / "src").mkdir(parents=True)
+    (tree / "src" / "lib.rs").write_text(
+        "pub fn parse(raw: Option<i32>) -> i32 {\n    raw.unwrap()\n}\n",
+        encoding="utf-8",
+    )
+    # Model-authored Git diffs often omit the final context line.  Strict
+    # `git apply` rejects this; CIVER's zero-context fallback must still apply
+    # it, because compile/analyzer/no-op checks decide whether it is a repair.
+    patch = (
+        "--- a/src/lib.rs\n"
+        "+++ b/src/lib.rs\n"
+        "@@ -1,2 +1,2 @@\n"
+        " pub fn parse(raw: Option<i32>) -> i32 {\n"
+        "-    raw.unwrap()\n"
+        "+    raw.unwrap_or(0)\n"
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    result = _apply_patch(patch, tree, LocalCommandRunner(), Settings().with_paths(tmp_path / "state"), work)
+    assert result == ""
+    assert "unwrap_or(0)" in (tree / "src" / "lib.rs").read_text(encoding="utf-8")

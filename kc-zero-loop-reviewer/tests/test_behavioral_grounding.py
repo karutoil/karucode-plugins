@@ -43,3 +43,23 @@ def test_a_suppressed_rule_is_not_a_grounding_source() -> None:
         suppressed=True,
     )
     assert _groundable(_site("crates/kc-core/src/lib.rs", 10), [finding]) is False
+
+
+def _candidate(path: str):
+    from zero_loop_reviewer.models import Candidate, Evidence, StageId
+
+    return Candidate(
+        id="c",
+        stage=StageId.PROBE,
+        title="a hypothesis",
+        evidence=Evidence(kind="llm_hypothesis"),
+        cited_sites=[_site(path)],
+    )
+
+
+def test_only_python_candidates_reach_probe_synthesis() -> None:
+    from zero_loop_reviewer.pipeline import _probe_supported
+
+    assert _probe_supported(_candidate("scripts/check.py")) is True
+    assert _probe_supported(_candidate("crates/kc-core/src/lib.rs")) is False
+    assert _probe_supported(_candidate("web/src/App.tsx")) is False
