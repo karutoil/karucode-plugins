@@ -36,38 +36,193 @@ mod model;
 #[allow(dead_code)]
 mod protocol;
 mod render;
-#[allow(dead_code)]
+#[allow(dead_code, unused_imports)]
 mod sdk;
 mod store;
 mod tools;
 mod worker;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde_json::{json, Value};
 
-use crate::sdk::{hooks, PanelRequest, PluginBuilder};
+use crate::sdk::{hooks, PanelRequest, Plugin, PluginBuilder, PluginSetting, PluginSettingKind};
 use crate::worker::{App, Intent};
 
-fn main() -> std::io::Result<()> {
-    let settings = config::Settings::from_settings(&config::settings());
-    let app = App::new(settings.clone());
-    if let Some(error) = app.error() {
-        eprintln!("kc-goals: the engine cannot reach the server: {error}");
-    }
+static APP: OnceLock<Arc<App>> = OnceLock::new();
 
-    // The engine only starts when it can do something. `enabled = false` leaves
-    // the process serving the tools and the panel, which is how an operator
-    // inspects or parks the plugin without uninstalling it.
-    if settings.enabled && settings.auto_continue {
-        worker::spawn(Arc::clone(&app));
-    }
+fn app() -> &'static Arc<App> {
+    APP.get_or_init(|| {
+        let settings = config::Settings::from_settings(&config::settings());
+        let instance = App::new(settings.clone());
+        if let Some(error) = instance.error() {
+            eprintln!("kc-goals: the engine cannot reach the server: {error}");
+        }
+        if settings.enabled && settings.auto_continue {
+            worker::spawn(Arc::clone(&instance));
+        }
+        instance
+    })
+}
 
-    let hook_app = Arc::clone(&app);
-    let run_app = Arc::clone(&app);
-    let panel_app = Arc::clone(&app);
+fn declared_settings() -> Vec<PluginSetting> {
+    let defaults = config::Settings::default();
+    vec![
+        PluginSetting {
+            key: "enabled".into(),
+            label: "Enable goal tracking and continuation".into(),
+            kind: PluginSettingKind::Bool,
+            default: json!(defaults.enabled),
+            help: "Master switch for prompt notes, ticks and automatic continuation.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "prompt".into(),
+            label: "Inject open-goal orientation in system prompt".into(),
+            kind: PluginSettingKind::Bool,
+            default: json!(defaults.prompt),
+            help: "Add a byte-stable note to the system prompt while a goal is open.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "auto_continue".into(),
+            label: "Auto-continue stopped runs".into(),
+            kind: PluginSettingKind::Bool,
+            default: json!(defaults.auto_continue),
+            help: "Automatically resume sessions when a run ends while a goal is still open.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "server".into(),
+            label: "karucode server URL".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(defaults.server),
+            help: "Loopback HTTP URL of the karucode server that spawned this plugin.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "token".into(),
+            label: "Server bearer token".into(),
+            kind: PluginSettingKind::Secret,
+            default: json!(""),
+            help: "Bearer token when the karucode server runs with KARUCODE_AUTH_TOKEN.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "tick_secs".into(),
+            label: "Reconcile tick interval (seconds)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.tick_secs),
+            help: "How often the reconciler re-examines sessions with an open goal.".into(),
+            min: Some(2.0),
+            max: Some(600.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "min_gap_secs".into(),
+            label: "Minimum gap between continuations (seconds)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.min_gap_secs),
+            help: "Floor between two continuations for the same session.".into(),
+            min: Some(0.0),
+            max: Some(3600.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "max_prompt_chars".into(),
+            label: "Max continuation prompt length (chars)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.max_prompt_chars),
+            help: "Character ceiling for the continuation user message.".into(),
+            min: Some(500.0),
+            max: Some(40_000.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "verify_commands".into(),
+            label: "Allow check commands on criteria".into(),
+            kind: PluginSettingKind::Bool,
+            default: json!(defaults.verify_commands),
+            help: "Run criterion `check` commands via goal_check (requires the `shell` permission).".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "check_timeout_secs".into(),
+            label: "Criterion check timeout (seconds)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.check_timeout_secs),
+            help: "How long a single criterion check command may run before being killed.".into(),
+            min: Some(5.0),
+            max: Some(600.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "state_dir".into(),
+            label: "State directory override".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(""),
+            help: "Optional directory for the session-to-workspace index (empty = default data dir).".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "max_continuations".into(),
+            label: "Default max continuations".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.default_budget.max_continuations),
+            help: "Default continuation cap when goal_set omits a budget (0 = unlimited).".into(),
+            min: Some(0.0),
+            max: Some(10_000.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "max_minutes".into(),
+            label: "Default max wall-clock minutes".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.default_budget.max_minutes),
+            help: "Default wall-clock ceiling in minutes when goal_set omits a budget (0 = unlimited).".into(),
+            min: Some(0.0),
+            max: Some(10_080.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "max_stalled_resumes".into(),
+            label: "Default max stalled resumes".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.default_budget.max_stalled_resumes),
+            help: "Resumes in a row with no tool call or goal_progress before pausing (0 = never pause).".into(),
+            min: Some(0.0),
+            max: Some(1000.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "max_failed_retries".into(),
+            label: "Default max failed retries".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.default_budget.max_failed_retries),
+            help: "Default retries after a failed run when goal_set omits a budget (0 = unlimited).".into(),
+            min: Some(0.0),
+            max: Some(1000.0),
+            options: Vec::new(),
+        },
+    ]
+}
 
-    let builder = PluginBuilder::new("kc-goals", env!("CARGO_PKG_VERSION"))
+fn build_plugin() -> Plugin {
+    let mut builder = PluginBuilder::new("kc-goals", env!("CARGO_PKG_VERSION"))
         .description(
             "A goal, a definition of done, and an engine that resumes a stopped run until the \
              goal is met, the budget is spent, or a human stops it.",
@@ -81,17 +236,19 @@ fn main() -> std::io::Result<()> {
         // feature is on: a criterion's command runs with this plugin's own OS
         // rights, which are the server user's.
         .permission(sdk::permissions::SHELL)
-        .notifications()
+        .notifications();
+    for setting in declared_settings() {
+        builder = builder.setting(setting);
+    }
+    let builder = builder
         // Layer 1: the orientation block. Byte-stable, and only while a goal is
         // open, so a session without one pays nothing and a session with one pays
         // for exactly two cache invalidations (start and end).
-        .hook(hooks::BEFORE_PROMPT, move |payload| {
-            prompt_block(&hook_app, &payload)
-        })
+        .hook(hooks::BEFORE_PROMPT, |payload| prompt_block(app(), &payload))
         // Trigger: record an intent and wake the engine. No HTTP here - the hook
         // runs inside the run's teardown, and it must return inside the host's
         // hook budget even if the server is wedged.
-        .hook(hooks::ON_RUN_END, move |payload| {
+        .hook(hooks::ON_RUN_END, |payload| {
             let session = payload
                 .get("session_id")
                 .and_then(Value::as_str)
@@ -110,22 +267,33 @@ fn main() -> std::io::Result<()> {
             if session.is_empty() || run_id.is_empty() {
                 return Value::Null;
             }
-            run_app.wake_with(Intent {
+            app().wake_with(Intent {
                 session_id: session,
                 run_id,
                 status,
             });
             Value::Null
         })
-        .panel_with(
-            "goals",
-            "Goals",
-            Some("check"),
-            5_000,
-            move |req: PanelRequest| panel(&panel_app, req),
-        );
+        .panel_with("goals", "Goals", Some("check"), 5_000, |req: PanelRequest| {
+            panel(app(), req)
+        });
 
-    tools::register(builder, Arc::clone(&app)).run()
+    tools::register(builder, app).build()
+}
+
+fn main() -> std::io::Result<()> {
+    // Initialize App and spawn the reconciler once the JSON-RPC loop is live so
+    // `plugin/settings/get` can reach the host.
+    std::thread::Builder::new()
+        .name("kc-goals-init".into())
+        .spawn(|| {
+            while !sdk::HostClient::global().is_live() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let _ = app();
+        })
+        .ok();
+    build_plugin().run()
 }
 
 /// The `before_prompt` answer: the block while this workspace has an open goal,
@@ -383,5 +551,13 @@ mod tests {
         assert_eq!(data["goals_dir"].as_str().unwrap(), &format!("{ws}/.karucode/goals"));
         assert!(data["error"].is_null());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn declared_settings_pass_host_validation() {
+        let p = build_plugin();
+        let settings = &p.manifest().settings;
+        assert_eq!(settings.len(), 15);
+        crate::sdk::validate_settings(settings).expect("declared settings must be valid");
     }
 }

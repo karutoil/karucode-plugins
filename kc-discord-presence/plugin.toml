@@ -1,0 +1,52 @@
+# Manifest form of the registration.
+#
+# The host discovers this file at `<data_dir>/plugins/discord-presence/plugin.toml`,
+# where `<data_dir>` defaults to ~/.local/share/karucode. `./install.sh` copies it
+# there with `command` rewritten to the built binary; then rescan
+# (`POST /api/plugins/reload`) or enable karucode's `plugins_watch`.
+#
+# Use EITHER this file OR a `[[plugins]]` entry in config.toml, never both: a name
+# registered twice fails the slot with an error naming both sources.
+#
+# Nothing here has to be filled in. The one thing the presence needs is a Discord
+# Application ID, and the intended way to give it one is to paste it into a chat
+# and let the agent call `discord_configure` - that writes
+# `<data_dir>/discord-presence/state.json` (mode 0600) and starts publishing. The
+# `[settings]` table below is for people who would rather keep it in config.
+
+name = "discord-presence"
+# Absolute: the plugin is spawned by the server, whose working directory is not
+# this one.
+command = ["/home/karutoil/karucode-plugins/kc-discord-presence/target/release/discord-presence"]
+enabled = true
+
+# The presence is a Unix socket to the local Discord client (no network at all);
+# the optional channel card is HTTPS. `files.read` is karucode's own database,
+# read read-only - that is what makes this plugin work with no API key.
+# `files.write` is the state file that remembers the Application ID.
+permissions = ["network", "files.read", "files.write"]
+
+[settings]
+# Optional. Everything here has a default, and `discord_configure` overrides the
+# application_id/webhook/thread/refresh/notify keys anyway.
+#
+# application_id = "123456789012345678"   # Developer Portal -> Application ID
+# presence = true                        # false keeps the id, drops the line
+# large_image = "karucode"               # asset key uploaded to the app, or an https URL
+# large_text = "karucode"
+# presence_socket = "/run/user/1000/discord-ipc-0"  # only if discovery misses it
+#
+# Optional channel card + notifications (not needed for the presence):
+# webhook_url = "https://discord.com/api/webhooks/123456789/abcDEF..."
+# thread_id = ""
+# refresh_secs = 20          # seconds between card edits; 0 turns the card off
+# notify = "needs_input,error"  # or "all", "none", "run_finished,error", ...
+# username = "karucode"
+# avatar_url = ""
+# include_recent = true
+# max_sessions = 3
+#
+# Only needed when karucode runs with a custom --data-dir: a plugin cannot see
+# KARUCODE_DATA_DIR (the host clears its environment), so the default is
+# $HOME/.local/share/karucode.
+# data_dir = "/home/karutoil/.local/share/karucode"

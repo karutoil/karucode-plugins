@@ -13,7 +13,8 @@
 //!   cannot read it from the environment by design, so it goes here or the calls
 //!   are refused with 401.
 
-use serde_json::Value;
+use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 
 pub const DEFAULT_SERVER: &str = "http://127.0.0.1:8787";
 
@@ -83,11 +84,36 @@ fn default_state_dir() -> String {
     }
 }
 
+fn json_u64(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_f64()
+            .filter(|f| f.is_finite() && *f >= 0.0 && *f <= u64::MAX as f64)
+            .map(|f| f.round() as u64)
+    })
+}
+
 pub fn settings() -> Value {
-    std::env::var("KARUCODE_PLUGIN_SETTINGS")
+    let env = std::env::var("KARUCODE_PLUGIN_SETTINGS")
         .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or(Value::Null)
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+    let rpc = if crate::sdk::HostClient::global().is_live() {
+        crate::sdk::settings()
+    } else {
+        BTreeMap::new()
+    };
+    if rpc.is_empty() {
+        return env;
+    }
+    let mut map = match env {
+        Value::Object(obj) => obj,
+        _ => Map::new(),
+    };
+    for (k, v) in rpc {
+        map.insert(k, v);
+    }
+    Value::Object(map)
 }
 
 impl Settings {
@@ -95,7 +121,7 @@ impl Settings {
         let mut config = Settings::default();
         let s = |k: &str| settings.get(k).and_then(Value::as_str);
         let b = |k: &str| settings.get(k).and_then(Value::as_bool);
-        let u = |k: &str| settings.get(k).and_then(Value::as_u64);
+        let u = |k: &str| settings.get(k).and_then(json_u64);
 
         if let Some(v) = b("enabled") {
             config.enabled = v;
@@ -107,7 +133,10 @@ impl Settings {
             config.auto_continue = v;
         }
         if let Some(v) = s("server") {
-            config.server = v.trim_end_matches('/').to_string();
+            let trimmed = v.trim().trim_end_matches('/');
+            if !trimmed.is_empty() {
+                config.server = trimmed.to_string();
+            }
         }
         if let Some(v) = s("token") {
             config.token = v.to_string();
@@ -128,24 +157,33 @@ impl Settings {
             config.check_timeout_secs = v.clamp(5, 600);
         }
         if let Some(v) = s("state_dir") {
-            if !v.is_empty() {
-                config.state_dir = v.trim_end_matches('/').to_string();
+            let trimmed = v.trim().trim_end_matches('/');
+            if !trimmed.is_empty() {
+                config.state_dir = trimmed.to_string();
             }
         }
-        if let Some(budget) = settings.get("budget") {
+        let budget_obj = settings.get("budget");
+        if let Some(budget) = budget_obj {
             config.default_budget = config.default_budget.merged_with(budget).clamped();
         }
-        // Flat spellings are convenient in a TOML `[plugins.settings]` table.
+        let default_stalled = super::model::Budget::default().max_stalled_resumes as u64;
+        let has_nested_stalled = budget_obj.is_some_and(|b| {
+            b.get("max_stalled_resumes").is_some() || b.get("max_no_progress").is_some()
+        });
+        let flat_stalled = u("max_stalled_resumes")
+            .filter(|v| !has_nested_stalled || *v != default_stalled)
+            .or_else(|| u("max_no_progress"));
+        // Flat spellings are convenient in a TOML `[plugins.settings]` table and
+        // in Settings -> Plugins & MCP.
         if u("max_continuations").is_some()
             || u("max_minutes").is_some()
-            || u("max_stalled_resumes").is_some()
-            || u("max_no_progress").is_some()
+            || flat_stalled.is_some()
             || u("max_failed_retries").is_some()
         {
             config.default_budget = config.default_budget.merged_with(&serde_json::json!({
                 "max_continuations": u("max_continuations"),
                 "max_minutes": u("max_minutes"),
-                "max_stalled_resumes": u("max_stalled_resumes").or_else(|| u("max_no_progress")),
+                "max_stalled_resumes": flat_stalled,
                 "max_failed_retries": u("max_failed_retries"),
             })).clamped();
         }

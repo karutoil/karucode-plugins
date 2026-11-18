@@ -58,7 +58,7 @@
 // allowances every unused protocol type would warn on the first build.
 #[allow(dead_code)]
 mod protocol;
-#[allow(dead_code)]
+#[allow(dead_code, unused_imports)]
 mod sdk;
 
 mod config;
@@ -68,8 +68,8 @@ mod session;
 
 use model::{List, Patch, Status};
 use sdk::{
-    hooks, permissions, PanelRequest, PluginBuilder, PluginToolResult, PluginToolResultExt,
-    ToolRequest,
+    hooks, permissions, PanelRequest, Plugin, PluginBuilder, PluginSetting, PluginSettingKind,
+    PluginToolResult, PluginToolResultExt, ToolRequest,
 };
 use serde_json::{json, Value};
 
@@ -643,7 +643,86 @@ fn on_tool_result(payload: Value) -> Value {
 // Wiring
 // ---------------------------------------------------------------------------
 
-fn main() -> std::io::Result<()> {
+fn declared_settings() -> Vec<PluginSetting> {
+    vec![
+        PluginSetting {
+            key: "max_in_progress".into(),
+            label: "Max concurrent in-progress items".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(1),
+            help: "Concurrent `in_progress` items allowed before `allow_parallel` is required."
+                .into(),
+            min: Some(1.0),
+            max: Some(32.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "carry_over_reminder".into(),
+            label: "Carry unfinished items into next prompt".into(),
+            kind: PluginSettingKind::Bool,
+            default: json!(true),
+            help: "Mention items left open when the previous run ended in before_prompt.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "compact_from".into(),
+            label: "Compact prompt summary threshold".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(24),
+            help:
+                "Item count above which the prompt block summarizes instead of listing every item."
+                    .into(),
+            min: Some(4.0),
+            max: Some(200.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "sessions_dir".into(),
+            label: "Per-session lists directory".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(config::DEFAULT_SESSIONS_DIR),
+            help: "Workspace-relative directory holding one JSON TODO list per session.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "list_path".into(),
+            label: "Legacy shared list path".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(config::DEFAULT_LIST_PATH),
+            help: "Legacy workspace-relative list read once to seed a new session that has none."
+                .into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "workspace".into(),
+            label: "Pinned workspace path".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(""),
+            help: "Optional workspace pin when the host does not send call context.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "session".into(),
+            label: "Pinned session ID".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(""),
+            help: "Optional session pin when the host does not send call context.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+    ]
+}
+
+fn build_plugin() -> Plugin {
     let workspace_arg = json!({
         "type": "string",
         "description": "Absolute project path. Normally unnecessary: the host sends the \
@@ -657,7 +736,7 @@ fn main() -> std::io::Result<()> {
                         Pass it only to read another session's list deliberately."
     });
 
-    PluginBuilder::new("kc-todo", env!("CARGO_PKG_VERSION"))
+    let mut builder = PluginBuilder::new("kc-todo", env!("CARGO_PKG_VERSION"))
         .description(
             "A TODO list that stays true: task/subtask trees, statuses that require \
              proof (done needs evidence, partial needs a limitation), and unfinished \
@@ -665,7 +744,11 @@ fn main() -> std::io::Result<()> {
         )
         // The list lives in the workspace, so the plugin reads and writes files.
         .permission(permissions::FILES_READ)
-        .permission(permissions::FILES_WRITE)
+        .permission(permissions::FILES_WRITE);
+    for setting in declared_settings() {
+        builder = builder.setting(setting);
+    }
+    builder
         .tool(
             "todo_plan",
             "Replace the TODO list with a plan. Each task may have subtasks (two levels \
@@ -819,7 +902,11 @@ fn main() -> std::io::Result<()> {
             0,
             panel_todo,
         )
-        .run()
+        .build()
+}
+
+fn main() -> std::io::Result<()> {
+    build_plugin().run()
 }
 
 // ---------------------------------------------------------------------------
@@ -951,5 +1038,13 @@ mod tests {
         let error = payload["error"].as_str().unwrap_or_default();
         assert!(error.contains("without a workspace"), "{payload}");
         assert_eq!(payload["items"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn declared_settings_pass_host_validation() {
+        let plugin = build_plugin();
+        let settings = &plugin.manifest().settings;
+        assert_eq!(settings.len(), 7);
+        sdk::validate_settings(settings).expect("declared settings must be valid");
     }
 }

@@ -1567,7 +1567,7 @@ exit 0
         assert!(!junk.exists(), "a malformed record must not be left behind");
 
         decoy.kill();
-        let _ = decoy.wait();
+        decoy.wait();
     }
 
     #[test]
@@ -1597,7 +1597,7 @@ exit 0
             "a group containing a backend process must be acceptable"
         );
         ours.kill();
-        let _ = ours.wait();
+        ours.wait();
 
         // A group of unrelated processes is not.
         let mut foreign = std::process::Command::new("sleep").arg("30").group_spawn();
@@ -1607,7 +1607,7 @@ exit 0
             "a group of foreign processes must be refused"
         );
         foreign.kill();
-        let _ = foreign.wait();
+        foreign.wait();
 
         // A group that does not exist is not ours either.
         assert!(!group_looks_like_a_backend(999_996));

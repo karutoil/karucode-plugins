@@ -6,6 +6,7 @@ target/
 
 # Not published from this repository.
 kc-knowledge-graph/
+kc-codegraph/
 
 # Never commit credentials or run logs.
 .env

@@ -52,6 +52,11 @@ class Plugin:
                 self.stderr.flush()
                 raise RuntimeError(f"plugin closed stdout; see {self.stderr.name}")
             frame = json.loads(line)
+            if frame.get("method") == "plugin/settings/get":
+                reply = {"jsonrpc": "2.0", "id": frame["id"], "result": {"settings": {}}}
+                self.process.stdin.write((json.dumps(reply) + "\n").encode())
+                self.process.stdin.flush()
+                continue
             if frame.get("method") == "notify":
                 self.notifications.append(frame.get("params", {}))
             if frame.get("id") == expected:

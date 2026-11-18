@@ -49,35 +49,262 @@ mod http;
 mod pace;
 #[allow(dead_code)]
 mod protocol;
-#[allow(dead_code)]
+#[allow(dead_code, unused_imports)]
 mod sdk;
 #[allow(dead_code)]
 mod watch;
 
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde_json::{json, Value};
 
-use sdk::{PanelRequest, PluginBuilder, PluginToolResult, PluginToolResultExt, ToolRequest};
+use sdk::{
+    PanelRequest, Plugin, PluginBuilder, PluginSetting, PluginSettingKind, PluginToolResult,
+    PluginToolResultExt, ToolRequest,
+};
 use watch::Shared;
 
-fn main() -> std::io::Result<()> {
-    let config = config::Config::from_settings(&config::settings());
-    let shared = Arc::new(Shared::new(config.clone()));
+fn shared() -> &'static Arc<Shared> {
+    static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
+    SHARED.get_or_init(|| {
+        let cfg = config::Config::from_settings(&config::settings());
+        let shared = Arc::new(Shared::new(cfg));
+        if shared.config.enabled && shared.config.watch {
+            watch::spawn(Arc::clone(&shared));
+        }
+        shared
+    })
+}
 
-    // The watcher only starts when it can do something. `enabled = false` leaves
-    // the process serving the panel and the tools, which is how an operator
-    // inspects the configuration without arming it.
-    if config.enabled && config.watch {
-        watch::spawn(Arc::clone(&shared));
-    }
+fn declared_settings() -> Vec<PluginSetting> {
+    let defaults = config::Config::default();
+    vec![
+        PluginSetting {
+            key: "enabled".into(),
+            label: "Enable pacing protection".into(),
+            kind: PluginSettingKind::Bool,
+            default: json!(defaults.enabled),
+            help: "Master switch for prompt contract, watcher and interventions.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "prompt".into(),
+            label: "Inject pacing contract in system prompt".into(),
+            kind: PluginSettingKind::Bool,
+            default: json!(defaults.prompt),
+            help: "Add the byte-stable pacing note to the system prompt.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "prompt_text".into(),
+            label: "Custom pacing contract text".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(""),
+            help: "Override the built-in pacing contract (empty = use built-in text).".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "watch".into(),
+            label: "Watch live event stream".into(),
+            kind: PluginSettingKind::Bool,
+            default: json!(defaults.watch),
+            help: "Subscribe to /api/events to detect turns that reason without acting.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "server".into(),
+            label: "karucode server URL".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(defaults.server),
+            help: "Loopback HTTP URL of the karucode server that spawned this plugin.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "token".into(),
+            label: "Server bearer token".into(),
+            kind: PluginSettingKind::Secret,
+            default: json!(""),
+            help: "Bearer token when the karucode server runs with KARUCODE_AUTH_TOKEN.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "models".into(),
+            label: "Target model substrings".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(defaults.models.join(",")),
+            help: "Comma-separated model id substrings to intervene on (empty = all models).".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "dry_run".into(),
+            label: "Dry run (record only, never steer/cancel)".into(),
+            kind: PluginSettingKind::Bool,
+            default: json!(defaults.dry_run),
+            help: "Record decisions in the panel without steering, cancelling or retrying.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "warn_after_secs".into(),
+            label: "Warn after (seconds)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.warn.after_secs),
+            help: "Seconds of narration without acting before warning (0 = off).".into(),
+            min: Some(0.0),
+            max: Some(3600.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "warn_after_chars".into(),
+            label: "Warn after (reasoning chars)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.warn.after_chars),
+            help: "Minimum reasoning characters before warning.".into(),
+            min: Some(0.0),
+            max: Some(100_000.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "steer_after_secs".into(),
+            label: "Steer after (seconds)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.steer.after_secs),
+            help: "Seconds of narration without acting before steering (0 = off).".into(),
+            min: Some(0.0),
+            max: Some(3600.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "steer_after_chars".into(),
+            label: "Steer after (reasoning chars)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.steer.after_chars),
+            help: "Minimum reasoning characters before steering.".into(),
+            min: Some(0.0),
+            max: Some(100_000.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "cancel_after_secs".into(),
+            label: "Cancel after (seconds)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.cancel.after_secs),
+            help: "Seconds of narration without acting before cancelling and retrying (0 = off).".into(),
+            min: Some(0.0),
+            max: Some(3600.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "cancel_after_chars".into(),
+            label: "Cancel after (reasoning chars)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.cancel.after_chars),
+            help: "Minimum reasoning characters before cancelling.".into(),
+            min: Some(0.0),
+            max: Some(200_000.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "drift_after_turns".into(),
+            label: "Drift check after turns".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.drift.after_turns),
+            help: "Iterations before checking cumulative reasoning drift (0 = off).".into(),
+            min: Some(0.0),
+            max: Some(100.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "drift_after_chars".into(),
+            label: "Drift check after (reasoning chars)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.drift.after_chars),
+            help: "Total reasoning characters before drift can be reported.".into(),
+            min: Some(0.0),
+            max: Some(200_000.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "drift_chars_per_tool_call".into(),
+            label: "Drift chars per tool call threshold".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.drift.chars_per_tool_call),
+            help: "Reasoning chars per tool call above which drift is reported.".into(),
+            min: Some(100.0),
+            max: Some(100_000.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "narration_min".into(),
+            label: "Narration phrases before early trigger".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.narration_min),
+            help: "Action-announcement hits that can fire a rung without waiting for chars.".into(),
+            min: Some(1.0),
+            max: Some(50.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "report_empty_run".into(),
+            label: "Report empty runs".into(),
+            kind: PluginSettingKind::Bool,
+            default: json!(defaults.report_empty_run),
+            help: "Emit a notification when a run ends with zero tool calls and zero answer.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "retry_empty_run".into(),
+            label: "Auto-retry empty runs".into(),
+            kind: PluginSettingKind::Bool,
+            default: json!(defaults.retry_empty_run),
+            help: "Queue a retry message after an empty run.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "cooldown_secs".into(),
+            label: "Intervention cooldown (seconds)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.cooldown_secs),
+            help: "Minimum seconds between steering or cancelling the same session.".into(),
+            min: Some(0.0),
+            max: Some(3600.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "reconnect_secs".into(),
+            label: "Event stream reconnect delay (seconds)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.reconnect_secs),
+            help: "Seconds to wait before reconnecting after /api/events drops.".into(),
+            min: Some(1.0),
+            max: Some(300.0),
+            options: Vec::new(),
+        },
+    ]
+}
 
-    let panel_shared = Arc::clone(&shared);
-    let status_shared = Arc::clone(&shared);
-    let explain_shared = Arc::clone(&shared);
-
-    PluginBuilder::new("kc-deepseek-pace", env!("CARGO_PKG_VERSION"))
+fn build_plugin() -> Plugin {
+    let mut builder = PluginBuilder::new("kc-deepseek-pace", env!("CARGO_PKG_VERSION"))
         .description(
             "Keeps DeepSeek V4.1-Flash working instead of narrating. A byte-stable pacing \
              contract in the system prompt, a live watcher for turns that reason without \
@@ -85,21 +312,21 @@ fn main() -> std::io::Result<()> {
         )
         // Only talks to the local server over loopback.
         .permission(sdk::permissions::NETWORK)
-        .notifications()
+        .notifications();
+    for setting in declared_settings() {
+        builder = builder.setting(setting);
+    }
+    builder
         // Layer 1: the prompt contract. Byte-stable by construction; see pace.rs
         // for why that is a hard requirement rather than a nicety.
-        .hook(sdk::hooks::BEFORE_PROMPT, {
-            let enabled = config.enabled;
-            let prompt = config.prompt;
-            let text = config.prompt_text.clone();
-            move |_payload| {
-                if !enabled || !prompt {
-                    return Value::Null;
-                }
-                match pace::prompt_block(&text) {
-                    Some(block) => Value::String(block),
-                    None => Value::Null,
-                }
+        .hook(sdk::hooks::BEFORE_PROMPT, |_payload| {
+            let cfg = &shared().config;
+            if !cfg.enabled || !cfg.prompt {
+                return Value::Null;
+            }
+            match pace::prompt_block(&cfg.prompt_text) {
+                Some(block) => Value::String(block),
+                None => Value::Null,
             }
         })
         // A run that ended with nothing is the case the hooks *can* see, so it is
@@ -117,13 +344,9 @@ fn main() -> std::io::Result<()> {
             }
             Value::Null
         })
-        .panel_with(
-            "pace",
-            "Pace",
-            Some("bolt"),
-            5_000,
-            move |req: PanelRequest| panel(&panel_shared, &req),
-        )
+        .panel_with("pace", "Pace", Some("bolt"), 5_000, |req: PanelRequest| {
+            panel(shared(), &req)
+        })
         .tool_with_class(
             "pace_status",
             "Report how the DeepSeek pacing watcher sees this session right now: the turn in \
@@ -140,14 +363,14 @@ fn main() -> std::io::Result<()> {
                 }
             }),
             Some("read_only"),
-            move |req: ToolRequest| {
+            |req: ToolRequest| {
                 let explicit = req.str_arg("session");
                 let session = if explicit.is_empty() {
                     req.session_id().unwrap_or_default().to_string()
                 } else {
                     explicit.to_string()
                 };
-                PluginToolResult::ok(status_text(&status_shared, &session))
+                PluginToolResult::ok(status_text(shared(), &session))
             },
         )
         .tool_with_class(
@@ -157,9 +380,24 @@ fn main() -> std::io::Result<()> {
              steered or cancelled, or how to tune it. Read-only.",
             json!({ "type": "object", "properties": {} }),
             Some("read_only"),
-            move |_req: ToolRequest| PluginToolResult::ok(explain_text(&explain_shared)),
+            |_req: ToolRequest| PluginToolResult::ok(explain_text(shared())),
         )
-        .run()
+        .build()
+}
+
+fn main() -> std::io::Result<()> {
+    // Initialize shared state (and start the SSE watcher if enabled) once the
+    // JSON-RPC loop is live so `plugin/settings/get` can reach the host.
+    std::thread::Builder::new()
+        .name("pace-init".into())
+        .spawn(|| {
+            while !sdk::HostClient::global().is_live() {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let _ = shared();
+        })
+        .ok();
+    build_plugin().run()
 }
 
 /// The inspector tab: the current turn, the ladder, and recent decisions.
@@ -387,4 +625,17 @@ cannot make a model act; it can only notice, ask, and stop.\n",
 #[allow(dead_code)]
 fn _assert_result_helpers() -> PluginToolResult {
     PluginToolResult::err("unused")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn declared_settings_pass_host_validation() {
+        let p = build_plugin();
+        let settings = &p.manifest().settings;
+        assert_eq!(settings.len(), 22);
+        sdk::validate_settings(settings).expect("declared settings must be valid");
+    }
 }

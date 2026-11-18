@@ -64,6 +64,11 @@ class Plugin:
             if not line:
                 raise SystemExit("the plugin closed stdout")
             frame = json.loads(line)
+            if frame.get("method") == "plugin/settings/get":
+                reply = {"jsonrpc": "2.0", "id": frame["id"], "result": {"settings": {}}}
+                self.proc.stdin.write((json.dumps(reply) + "\n").encode())
+                self.proc.stdin.flush()
+                continue
             if frame.get("id") == self.next_id:
                 return frame
         raise SystemExit(f"no answer to {method} within {timeout}s")

@@ -41,7 +41,7 @@
 // allowances every unused protocol type would warn on the first build.
 #[allow(dead_code)]
 mod protocol;
-#[allow(dead_code)]
+#[allow(dead_code, unused_imports)]
 mod sdk;
 
 mod config;
@@ -51,10 +51,11 @@ mod tools;
 
 use mcp::{Backend, BackendConfig};
 use sdk::{
-    hooks, permissions, PanelRequest, PluginBuilder, PluginToolResult, PluginToolResultExt,
-    ToolRequest,
+    hooks, permissions, HostClient, PanelRequest, Plugin, PluginBuilder, PluginSetting,
+    PluginSettingKind, PluginToolResult, PluginToolResultExt, ToolRequest,
 };
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -71,16 +72,7 @@ use tools::{Outcome, TOOLS};
 fn backend() -> &'static Mutex<Backend> {
     static BACKEND: OnceLock<Mutex<Backend>> = OnceLock::new();
     BACKEND.get_or_init(|| {
-        let (settings, problem) = Settings::parse(
-            std::env::var("KARUCODE_PLUGIN_SETTINGS")
-                .ok()
-                .as_deref(),
-        );
-        if let Some(problem) = problem {
-            // Report and carry on with the defaults: taking the tools away over a
-            // typo would be worse than running with the documented configuration.
-            eprintln!("[free-search] {problem}");
-        }
+        let settings = settings();
         Mutex::new(Backend::new(BackendConfig {
             command: settings.command.clone(),
             env: settings.backend_env().into_iter().collect(),
@@ -90,11 +82,37 @@ fn backend() -> &'static Mutex<Backend> {
     })
 }
 
-/// The settings this process is running with (parsed once, in `main`).
+/// The settings this process is running with (initialized lazily inside `run()`
+/// from `plugin/settings/get` merged over `KARUCODE_PLUGIN_SETTINGS`).
 static SETTINGS: OnceLock<Settings> = OnceLock::new();
 
 fn settings() -> &'static Settings {
-    SETTINGS.get_or_init(|| Settings::parse(std::env::var("KARUCODE_PLUGIN_SETTINGS").ok().as_deref()).0)
+    SETTINGS.get_or_init(|| {
+        let raw = std::env::var("KARUCODE_PLUGIN_SETTINGS").ok();
+        let env = raw
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .and_then(|r| match serde_json::from_str::<Value>(r) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    eprintln!("[free-search] plugin settings are not valid JSON ({e}); using defaults");
+                    None
+                }
+            })
+            .unwrap_or(Value::Null);
+        let rpc = if HostClient::global().is_live() {
+            sdk::settings()
+        } else {
+            BTreeMap::new()
+        };
+        let merged = Settings::merge_env_and_rpc(env, rpc);
+        let (parsed, problem) = Settings::from_value(&merged);
+        if let Some(problem) = problem {
+            eprintln!("[free-search] {problem}");
+        }
+        parsed
+    })
 }
 
 /// Run `f` against the backend, turning a poisoned lock into a tool error
@@ -147,6 +165,11 @@ fn with_backend_bounded<T>(
 /// One tool call: supervise, forward, translate the result.
 fn call_backend(req: &ToolRequest, name: &str) -> PluginToolResult {
     let settings = settings();
+    if !settings.exposes(name) {
+        return PluginToolResult::err(format!(
+            "`{name}` is disabled by the `tools` plugin setting."
+        ));
+    }
     // The backend takes the arguments it documents and nothing else. Passing a
     // stray key would be a schema error at best and silently ignored at worst,
     // so the curated `format` default is applied here where it is visible.
@@ -411,13 +434,82 @@ fn panel_status(req: PanelRequest) -> Value {
     })
 }
 
-fn main() -> std::io::Result<()> {
-    let (settings, problem) = Settings::parse(std::env::var("KARUCODE_PLUGIN_SETTINGS").ok().as_deref());
-    if let Some(problem) = &problem {
-        eprintln!("[free-search] {problem}");
-    }
-    let _ = SETTINGS.set(settings.clone());
+fn declared_settings() -> Vec<PluginSetting> {
+    vec![
+        PluginSetting {
+            key: "command".into(),
+            label: "Search backend command".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(config::DEFAULT_COMMAND.join(" ")),
+            help: "Command and arguments used to spawn free-search-mcp.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "cache_dir".into(),
+            label: "Backend cache directory".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(""),
+            help: "Optional SEARCH_MCP_CACHE_DIR override (empty = upstream default).".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "call_timeout_secs".into(),
+            label: "Backend call timeout (seconds)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(config::DEFAULT_CALL_TIMEOUT_SECS),
+            help: "Seconds one call may wait on the backend (keep under 52s to fit the 60s host cap).".into(),
+            min: Some(1.0),
+            max: Some(3600.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "start_timeout_secs".into(),
+            label: "Backend startup timeout (seconds)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(config::DEFAULT_START_TIMEOUT_SECS),
+            help: "Seconds a cold uvx install/startup may take before failing.".into(),
+            min: Some(1.0),
+            max: Some(3600.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "max_output_bytes".into(),
+            label: "Max tool output bytes".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(config::DEFAULT_MAX_OUTPUT_BYTES),
+            help: "Soft byte cap before returning a truncation/pagination hint.".into(),
+            min: Some(500.0),
+            max: Some(1_000_000.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "prewarm".into(),
+            label: "Prewarm Python backend at startup".into(),
+            kind: PluginSettingKind::Bool,
+            default: json!(true),
+            help: "Spawn free-search-mcp in the background when the plugin starts so the first search is fast.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "tools".into(),
+            label: "Exposed tools filter".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(""),
+            help: "Comma-separated backend tool names to expose (empty = all tools).".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+    ]
+}
 
+fn build_plugin(env_settings: &Settings) -> Plugin {
     let mut builder = PluginBuilder::new("free-search", env!("CARGO_PKG_VERSION"))
         .description(
             "Keyless multi-engine web search, page fetching and document reading, with a \
@@ -428,9 +520,12 @@ fn main() -> std::io::Result<()> {
         // `[[plugins]]` entry has to grant these or the tools are not exposed.
         .permission(permissions::SHELL)
         .permission(permissions::NETWORK);
+    for setting in declared_settings() {
+        builder = builder.setting(setting);
+    }
 
     for (name, schema) in schemas::all() {
-        if !settings.exposes(name) {
+        if !env_settings.exposes(name) {
             continue;
         }
         let Some(spec) = tools::spec_for(name) else {
@@ -463,33 +558,41 @@ fn main() -> std::io::Result<()> {
         );
     }
 
-    builder = builder
+    builder
         .hook(hooks::BEFORE_PROMPT, before_prompt)
-        .panel_with("status", "Free search", Some("search"), 0, panel_status);
+        .panel_with("status", "Free search", Some("search"), 0, panel_status)
+        .build()
+}
 
-    // Opt-in: start the backend now so the first search does not pay for the
-    // interpreter. Off by default because it holds a Python process resident for
-    // the whole session, and a search that is never made should cost nothing.
-    if settings.prewarm {
-        std::thread::Builder::new()
-            .name("free-search-prewarm".into())
-            .spawn(|| {
-                let outcome = with_backend(|backend| {
-                    let started = backend.ensure_started();
-                    (started, backend.server_info().map(|s| s.version.clone()))
-                });
-                match outcome {
-                    Ok((Ok(()), version)) => {
-                        eprintln!("[free-search] backend ready (version {version:?})")
-                    }
-                    Ok((Err(e), _)) => eprintln!("[free-search] prewarm failed: {e}"),
-                    Err(_) => eprintln!("[free-search] prewarm skipped: the backend lock is poisoned"),
+fn main() -> std::io::Result<()> {
+    let (env_settings, _) = Settings::parse(std::env::var("KARUCODE_PLUGIN_SETTINGS").ok().as_deref());
+    let plugin = build_plugin(&env_settings);
+
+    // Prewarm in a background thread once the JSON-RPC loop is live so
+    // `settings()` can read operator overrides from `plugin/settings/get`.
+    std::thread::Builder::new()
+        .name("free-search-prewarm".into())
+        .spawn(|| {
+            while !HostClient::global().is_live() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if !settings().prewarm {
+                return;
+            }
+            let outcome = with_backend(|backend| {
+                let started = backend.ensure_started();
+                (started, backend.server_info().map(|s| s.version.clone()))
+            });
+            match outcome {
+                Ok((Ok(()), version)) => {
+                    eprintln!("[free-search] backend ready (version {version:?})")
                 }
-            })
-            .ok();
-    }
+                Ok((Err(e), _)) => eprintln!("[free-search] prewarm failed: {e}"),
+                Err(_) => eprintln!("[free-search] prewarm skipped: the backend lock is poisoned"),
+            }
+        })
+        .ok();
 
-    let mut plugin = builder.build();
     plugin.run()?;
 
     // The SDK returns on `shutdown` or EOF. Stopping the backend here is what
@@ -766,5 +869,13 @@ mod tests {
         assert!(settings.max_output_bytes < 24_000);
         assert!(Settings::default().call_timeout_secs < 60);
         assert!(Settings::default().max_output_bytes < 24_000);
+    }
+
+    #[test]
+    fn declared_settings_pass_host_validation() {
+        let p = build_plugin(&Settings::default());
+        let settings = &p.manifest().settings;
+        assert_eq!(settings.len(), 7);
+        sdk::validate_settings(settings).expect("declared settings must be valid");
     }
 }

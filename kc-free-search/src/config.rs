@@ -12,7 +12,8 @@
 //! start would take the tools away over a typo in a key nothing depends on.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 
 /// The backend command the upstream project documents for a stdio MCP client.
 pub const DEFAULT_COMMAND: [&str; 4] = ["uvx", "--from", "free-search-mcp", "search-mcp"];
@@ -131,18 +132,147 @@ impl Settings {
         };
         match serde_json::from_str::<Value>(raw) {
             Ok(Value::Null) => (Self::default(), None),
-            Ok(value) => match serde_json::from_value::<Self>(value) {
-                Ok(settings) => (settings.normalized(), None),
-                Err(e) => (
-                    Self::default(),
-                    Some(format!("plugin settings are invalid ({e}); using defaults")),
-                ),
-            },
+            Ok(value) => Self::from_value(&value),
             Err(e) => (
                 Self::default(),
                 Some(format!("plugin settings are not valid JSON ({e}); using defaults")),
             ),
         }
+    }
+
+    pub fn from_value(value: &Value) -> (Self, Option<String>) {
+        if value.is_null() {
+            return (Self::default(), None);
+        }
+        let Some(obj) = value.as_object() else {
+            return (
+                Self::default(),
+                Some("plugin settings are invalid (expected an object); using defaults".into()),
+            );
+        };
+        let mut settings = Self::default();
+        if let Some(cmd) = obj.get("command") {
+            match cmd {
+                Value::Array(items) => {
+                    let mut argv = Vec::with_capacity(items.len());
+                    for item in items {
+                        let Some(s) = item.as_str() else {
+                            return (
+                                Self::default(),
+                                Some("plugin settings are invalid (`command` items must be strings); using defaults".into()),
+                            );
+                        };
+                        argv.push(s.to_string());
+                    }
+                    settings.command = argv;
+                }
+                Value::String(text) => {
+                    let argv: Vec<String> = text.split_whitespace().map(str::to_string).collect();
+                    if !argv.is_empty() {
+                        settings.command = argv;
+                    }
+                }
+                _ => {
+                    return (
+                        Self::default(),
+                        Some("plugin settings are invalid (`command` must be a list or string); using defaults".into()),
+                    );
+                }
+            }
+        }
+        if let Some(env_val) = obj.get("env") {
+            match serde_json::from_value::<BTreeMap<String, String>>(env_val.clone()) {
+                Ok(env) => settings.env = env,
+                Err(e) => {
+                    return (
+                        Self::default(),
+                        Some(format!("plugin settings are invalid (`env`: {e}); using defaults")),
+                    );
+                }
+            }
+        }
+        if let Some(cache) = obj.get("cache_dir") {
+            match cache {
+                Value::Null => settings.cache_dir = None,
+                Value::String(s) => {
+                    let trimmed = s.trim();
+                    settings.cache_dir = if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    };
+                }
+                _ => {
+                    return (
+                        Self::default(),
+                        Some("plugin settings are invalid (`cache_dir` must be a string); using defaults".into()),
+                    );
+                }
+            }
+        }
+        if let Some(v) = obj.get("call_timeout_secs").and_then(json_u64) {
+            settings.call_timeout_secs = v;
+        }
+        if let Some(v) = obj.get("start_timeout_secs").and_then(json_u64) {
+            settings.start_timeout_secs = v;
+        }
+        if let Some(v) = obj.get("max_output_bytes").and_then(json_u64) {
+            settings.max_output_bytes = v as usize;
+        }
+        if let Some(v) = obj.get("prewarm").and_then(Value::as_bool) {
+            settings.prewarm = v;
+        }
+        if let Some(tools) = obj.get("tools") {
+            match tools {
+                Value::Array(items) => {
+                    let mut list = Vec::with_capacity(items.len());
+                    for item in items {
+                        let Some(s) = item.as_str() else {
+                            return (
+                                Self::default(),
+                                Some("plugin settings are invalid (`tools` items must be strings); using defaults".into()),
+                            );
+                        };
+                        list.push(s.to_string());
+                    }
+                    settings.tools = list;
+                }
+                Value::String(text) => {
+                    settings.tools = text.split(',').map(str::to_string).collect();
+                }
+                _ => {
+                    return (
+                        Self::default(),
+                        Some("plugin settings are invalid (`tools` must be a list or string); using defaults".into()),
+                    );
+                }
+            }
+        }
+        (settings.normalized(), None)
+    }
+
+    pub fn merge_env_and_rpc(env: Value, rpc: BTreeMap<String, Value>) -> Value {
+        let mut map = match env {
+            Value::Object(obj) => obj,
+            _ => Map::new(),
+        };
+        let default_cmd = DEFAULT_COMMAND.join(" ");
+        for (k, v) in rpc {
+            if k == "command"
+                && v.as_str().is_some_and(|s| s.trim() == default_cmd)
+                && map.get("command").is_some_and(Value::is_array)
+            {
+                continue;
+            }
+            if k == "tools"
+                && v.as_str().is_some_and(|s| s.trim().is_empty())
+                && map.get("tools").is_some_and(Value::is_array)
+            {
+                continue;
+            }
+            map.insert(k, v);
+        }
+        Value::Object(map)
     }
 
     /// Clamp the values a bad hand-written config could make nonsensical.
@@ -189,6 +319,15 @@ impl Settings {
     pub fn command_line(&self) -> String {
         self.command.join(" ")
     }
+}
+
+fn json_u64(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_f64()
+            .filter(|f| f.is_finite() && *f >= 0.0 && *f <= u64::MAX as f64)
+            .map(|f| f.round() as u64)
+    })
 }
 
 #[cfg(test)]
@@ -252,8 +391,8 @@ mod tests {
     fn the_call_timeout_stays_under_the_host_budget() {
         // The whole point: this plugin answers before karucode's 60 s cut-off so
         // the model gets a message that names the remedy.
-        assert!(DEFAULT_CALL_TIMEOUT_SECS < 60);
-        assert!(DEFAULT_MAX_OUTPUT_BYTES < 24_000);
+        const { assert!(DEFAULT_CALL_TIMEOUT_SECS < 60) };
+        const { assert!(DEFAULT_MAX_OUTPUT_BYTES < 24_000) };
     }
 
     #[test]

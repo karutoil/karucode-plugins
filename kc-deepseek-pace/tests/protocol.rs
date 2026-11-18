@@ -26,11 +26,16 @@ struct Plugin {
     stdin: Option<ChildStdin>,
     lines: Receiver<String>,
     id: u64,
+    rpc_settings: Value,
 }
 
 impl Plugin {
     /// Spawn the binary with the given `settings` JSON, as the host does.
     fn spawn(settings: Value) -> Self {
+        Self::spawn_with_rpc(settings, json!({}))
+    }
+
+    fn spawn_with_rpc(settings: Value, rpc_settings: Value) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_kc-deepseek-pace"))
             .env("KARUCODE_PLUGIN_SETTINGS", settings.to_string())
             // The watcher must not reach a real server from a test.
@@ -60,6 +65,7 @@ impl Plugin {
             stdin,
             lines,
             id: 0,
+            rpc_settings,
         }
     }
 
@@ -86,6 +92,13 @@ impl Plugin {
                 .recv_timeout(WAIT)
                 .unwrap_or_else(|_| panic!("no response to `{method}` in {WAIT:?}"));
             let response: Value = serde_json::from_str(&line).expect("json response");
+            if response.get("method").and_then(Value::as_str) == Some("plugin/settings/get") {
+                if let Some(req_id) = response.get("id") {
+                    let reply = json!({"jsonrpc":"2.0","id":req_id,"result":{"settings": self.rpc_settings}});
+                    self.send_raw(reply);
+                }
+                continue;
+            }
             // Notifications (`notify` frames) are interleaved with responses and
             // carry no id; skip them here and read them in the notify test.
             if response.get("id").and_then(Value::as_u64) != Some(id) {
@@ -100,6 +113,7 @@ impl Plugin {
     }
 
     /// Read the next `notify` frame, which has no id.
+    #[allow(dead_code)]
     fn next_notify(&mut self) -> Value {
         loop {
             let line = self
@@ -395,12 +409,24 @@ fn settings_are_read_from_the_environment_the_way_the_host_sends_them() {
 fn a_shutdown_request_ends_the_process_cleanly() {
     let mut plugin = Plugin::quiet();
     plugin.initialize();
-    plugin.id += 1;
-    let id = plugin.id;
-    plugin.send_raw(json!({"jsonrpc": "2.0", "id": id, "method": "shutdown", "params": {}}));
+    let reply = plugin.request("shutdown", json!({}));
+    assert!(reply.is_null(), "{reply}");
     // The SDK answers the request, then `run` returns and the process exits.
     let status = wait_for_exit(&mut plugin.child, Duration::from_secs(5));
     assert!(status.is_some(), "the plugin did not exit after `shutdown`");
+}
+
+#[test]
+fn plugin_settings_get_overrides_env_settings() {
+    let mut plugin = Plugin::spawn_with_rpc(
+        json!({"watch": false, "dry_run": false}),
+        json!({"watch": false, "dry_run": true, "cooldown_secs": 19}),
+    );
+    plugin.initialize();
+    let panel = plugin.request("panels/read", json!({"panel": "pace", "session_id": "s"}));
+    let data = &panel["data"];
+    assert_eq!(data["dry_run"], true);
+    assert_eq!(data["ladder"]["cooldown_secs"], 19);
 }
 
 fn wait_for_exit(child: &mut Child, within: Duration) -> Option<std::process::ExitStatus> {

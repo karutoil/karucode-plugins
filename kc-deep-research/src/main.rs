@@ -17,17 +17,18 @@ mod plan;
 mod protocol;
 mod report;
 #[rustfmt::skip]
-#[allow(dead_code)]
+#[allow(dead_code, unused_imports)]
 mod sdk;
 
 use config::Settings;
 use gateway::McpGateway;
 use model::{Job, RunState, Store};
 use sdk::{
-    hooks, permissions, PanelRequest, PluginBuilder, PluginToolResult, PluginToolResultExt,
-    ToolRequest,
+    hooks, permissions, HostClient, PanelRequest, PluginBuilder, PluginSetting, PluginSettingKind,
+    PluginToolResult, PluginToolResultExt, ToolRequest,
 };
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -35,8 +36,26 @@ use std::time::Duration;
 fn settings() -> &'static Settings {
     static SETTINGS: OnceLock<Settings> = OnceLock::new();
     SETTINGS.get_or_init(|| {
-        let (settings, problem) =
-            Settings::parse(std::env::var("KARUCODE_PLUGIN_SETTINGS").ok().as_deref());
+        let raw = std::env::var("KARUCODE_PLUGIN_SETTINGS").ok();
+        let env = raw
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .and_then(|r| match serde_json::from_str::<Value>(r) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    eprintln!("[deep-research] plugin settings are not valid JSON ({e}); using defaults");
+                    None
+                }
+            })
+            .unwrap_or(Value::Null);
+        let rpc = if HostClient::global().is_live() {
+            sdk::settings()
+        } else {
+            BTreeMap::new()
+        };
+        let merged = Settings::merge_env_and_rpc(env, rpc);
+        let (settings, problem) = Settings::from_value(&merged);
         if let Some(problem) = problem {
             eprintln!("[deep-research] {problem}");
         }
@@ -349,14 +368,83 @@ fn panel(req: PanelRequest) -> Value {
     })
 }
 
+fn declared_settings() -> Vec<PluginSetting> {
+    vec![
+        PluginSetting {
+            key: "command".into(),
+            label: "Search backend command".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(config::DEFAULT_COMMAND.join(" ")),
+            help: "Command and arguments used to spawn free-search-mcp.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "cache_dir".into(),
+            label: "Backend cache directory".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(""),
+            help: "Optional SEARCH_MCP_CACHE_DIR override (empty = upstream default).".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "call_timeout_secs".into(),
+            label: "Backend call timeout (seconds)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(config::DEFAULT_CALL_TIMEOUT_SECS),
+            help: "Per-request deadline for a single backend search or fetch call.".into(),
+            min: Some(1.0),
+            max: Some(300.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "start_timeout_secs".into(),
+            label: "Backend startup timeout (seconds)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(config::DEFAULT_START_TIMEOUT_SECS),
+            help: "How long a cold uvx backend start may take before failing.".into(),
+            min: Some(1.0),
+            max: Some(300.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "max_output_bytes".into(),
+            label: "Max inline output bytes".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(config::DEFAULT_MAX_OUTPUT_BYTES),
+            help: "Default byte ceiling for report pages and tool results.".into(),
+            min: Some(1000.0),
+            max: Some(20_000.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "max_active_jobs".into(),
+            label: "Max concurrent research jobs".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(2),
+            help: "Maximum simultaneous research jobs (each holds one backend process).".into(),
+            min: Some(1.0),
+            max: Some(4.0),
+            options: Vec::new(),
+        },
+    ]
+}
+
 fn build_plugin() -> sdk::Plugin {
-    PluginBuilder::new("deep-research", env!("CARGO_PKG_VERSION"))
+    let mut builder = PluginBuilder::new("deep-research", env!("CARGO_PKG_VERSION"))
         .description(
             "Sustained background web research on free-search-mcp: gap-driven searches, source reading, \
              evidence coverage, cross-source coverage, explicit gaps, and paginated cited reports.",
         )
         .permission(permissions::SHELL)
-        .permission(permissions::NETWORK)
+        .permission(permissions::NETWORK);
+    for setting in declared_settings() {
+        builder = builder.setting(setting);
+    }
+    builder
         .tool_with_class(
             "start",
             "Start a sustained background research job. Supply the full question and optional explicit aspects. \
@@ -433,8 +521,7 @@ fn build_plugin() -> sdk::Plugin {
 }
 
 fn main() -> std::io::Result<()> {
-    let _ = settings();
-    let mut plugin = build_plugin();
+    let plugin = build_plugin();
     plugin.run()?;
     store().shutdown();
     Ok(())
@@ -457,7 +544,7 @@ mod tests {
 
     #[test]
     fn tool_surface_is_stable_and_bounded() {
-        let mut plugin = build_plugin();
+        let plugin = build_plugin();
         assert_eq!(plugin.manifest().name, "deep-research");
         assert_eq!(plugin.manifest().protocol, "1");
         let listed = plugin
@@ -515,5 +602,13 @@ mod tests {
                 .any(|line| line.trim_start().starts_with("read_only_tools")),
             "a data-dir manifest cannot grant itself approval exemptions"
         );
+    }
+
+    #[test]
+    fn declared_settings_pass_host_validation() {
+        let plugin = build_plugin();
+        let settings = &plugin.manifest().settings;
+        assert_eq!(settings.len(), 6);
+        sdk::validate_settings(settings).expect("declared settings must be valid");
     }
 }

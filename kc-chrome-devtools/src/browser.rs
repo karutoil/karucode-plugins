@@ -90,8 +90,25 @@ pub const DEFAULT_VIEWPORT_HEIGHT: u32 = 900;
 pub const MIN_VIEWPORT: u32 = 100;
 pub const MAX_VIEWPORT: u32 = 10_000;
 
+fn json_u64(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_f64()
+            .filter(|f| f.is_finite() && *f >= 0.0 && *f <= u64::MAX as f64)
+            .map(|f| f.round() as u64)
+    })
+}
+
+fn non_empty_str(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 impl BrowserConfig {
-    /// Build from the `KARUCODE_PLUGIN_SETTINGS` JSON delivered by the host.
+    /// Build from `plugin/settings/get` merged over `KARUCODE_PLUGIN_SETTINGS`.
     pub fn from_settings(settings: &Value) -> Self {
         let mut config = Self::default();
         if let Some(value) = settings.get("headless").and_then(|v| v.as_bool()) {
@@ -100,37 +117,62 @@ impl BrowserConfig {
         if let Some(value) = settings.get("isolated").and_then(|v| v.as_bool()) {
             config.isolated = value;
         }
-        if let Some(value) = settings.get("chrome_path").and_then(|v| v.as_str()) {
-            config.chrome_path = Some(value.to_string());
+        if let Some(value) = settings.get("chrome_path").and_then(non_empty_str) {
+            config.chrome_path = Some(value);
         }
-        if let Some(value) = settings.get("user_data_dir").and_then(|v| v.as_str()) {
-            config.user_data_dir = Some(value.to_string());
+        if let Some(value) = settings.get("user_data_dir").and_then(non_empty_str) {
+            config.user_data_dir = Some(value);
             config.isolated = false;
         }
         if let Some(viewport) = settings.get("viewport") {
-            let width = viewport.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let height = viewport.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let width = viewport.get("width").and_then(json_u64).unwrap_or(0) as u32;
+            let height = viewport.get("height").and_then(json_u64).unwrap_or(0) as u32;
             if width > 0 && height > 0 {
-                config.viewport = Some((width, height));
+                config.viewport = Some((
+                    width.clamp(MIN_VIEWPORT, MAX_VIEWPORT),
+                    height.clamp(MIN_VIEWPORT, MAX_VIEWPORT),
+                ));
             }
         }
-        if let Some(value) = settings.get("protocol_timeout_secs").and_then(|v| v.as_u64()) {
-            config.protocol_timeout_secs = value.max(1);
+        let has_viewport_obj = settings.get("viewport").is_some_and(|v| v.is_object());
+        let (mut vw, mut vh) = config
+            .viewport
+            .unwrap_or((DEFAULT_VIEWPORT_WIDTH, DEFAULT_VIEWPORT_HEIGHT));
+        if let Some(w) = settings.get("viewport_width").and_then(json_u64) {
+            let w = (w as u32).clamp(MIN_VIEWPORT, MAX_VIEWPORT);
+            if !has_viewport_obj || w != DEFAULT_VIEWPORT_WIDTH {
+                vw = w;
+            }
         }
-        if let Some(value) = settings.get("startup_timeout_secs").and_then(|v| v.as_u64()) {
-            config.startup_timeout_secs = value.max(1);
+        if let Some(h) = settings.get("viewport_height").and_then(json_u64) {
+            let h = (h as u32).clamp(MIN_VIEWPORT, MAX_VIEWPORT);
+            if !has_viewport_obj || h != DEFAULT_VIEWPORT_HEIGHT {
+                vh = h;
+            }
         }
-        if let Some(value) = settings.get("extra_args").and_then(|v| v.as_array()) {
-            config.extra_args = value
-                .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect();
+        config.viewport = Some((vw, vh));
+        if let Some(value) = settings.get("protocol_timeout_secs").and_then(json_u64) {
+            config.protocol_timeout_secs = value.clamp(1, 600);
         }
-        if let Some(value) = settings.get("snapshot_dir").and_then(|v| v.as_str()) {
-            config.snapshot_dir = Some(value.to_string());
+        if let Some(value) = settings.get("startup_timeout_secs").and_then(json_u64) {
+            config.startup_timeout_secs = value.clamp(1, 600);
         }
-        if let Some(value) = settings.get("max_snapshot_nodes").and_then(|v| v.as_u64()) {
-            config.max_snapshot_nodes = value.max(50) as usize;
+        if let Some(extra) = settings.get("extra_args") {
+            if let Some(list) = extra.as_array() {
+                config.extra_args = list
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()))
+                    .map(str::to_string)
+                    .collect();
+            } else if let Some(text) = extra.as_str() {
+                config.extra_args = text.split_whitespace().map(str::to_string).collect();
+            }
+        }
+        if let Some(value) = settings.get("snapshot_dir").and_then(non_empty_str) {
+            config.snapshot_dir = Some(value);
+        }
+        if let Some(value) = settings.get("max_snapshot_nodes").and_then(json_u64) {
+            config.max_snapshot_nodes = (value as usize).clamp(50, 100_000);
         }
         config
     }
@@ -1551,6 +1593,34 @@ mod tests {
         let config = BrowserConfig::from_settings(&json!({"user_data_dir": "/home/me/.config/x"}));
         assert!(!config.isolated);
         assert_eq!(config.user_data_dir.as_deref(), Some("/home/me/.config/x"));
+    }
+
+    #[test]
+    fn empty_string_defaults_keep_optional_paths_unset_and_isolated() {
+        let config = BrowserConfig::from_settings(&json!({
+            "chrome_path": "",
+            "user_data_dir": "   ",
+            "snapshot_dir": "",
+            "extra_args": "",
+        }));
+        assert!(config.isolated);
+        assert_eq!(config.chrome_path, None);
+        assert_eq!(config.user_data_dir, None);
+        assert_eq!(config.snapshot_dir, None);
+        assert!(config.extra_args.is_empty());
+    }
+
+    #[test]
+    fn flat_viewport_extra_args_string_and_float_numbers_work() {
+        let config = BrowserConfig::from_settings(&json!({
+            "viewport_width": 1280.0,
+            "viewport_height": 720.0,
+            "protocol_timeout_secs": 45.0,
+            "extra_args": "--no-sandbox --disable-gpu",
+        }));
+        assert_eq!(config.viewport, Some((1280, 720)));
+        assert_eq!(config.protocol_timeout_secs, 45);
+        assert_eq!(config.extra_args, vec!["--no-sandbox", "--disable-gpu"]);
     }
 
     #[test]

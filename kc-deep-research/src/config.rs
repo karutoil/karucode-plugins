@@ -61,19 +61,14 @@ impl Default for Settings {
 }
 
 impl Settings {
+    #[cfg(test)]
     pub fn parse(raw: Option<&str>) -> (Self, Option<String>) {
         let Some(raw) = raw.map(str::trim).filter(|r| !r.is_empty()) else {
             return (Self::default(), None);
         };
         match serde_json::from_str::<Value>(raw) {
             Ok(Value::Null) => (Self::default(), None),
-            Ok(value) => match serde_json::from_value::<Self>(value) {
-                Ok(settings) => (settings.normalized(), None),
-                Err(e) => (
-                    Self::default(),
-                    Some(format!("plugin settings are invalid ({e}); using defaults")),
-                ),
-            },
+            Ok(value) => Self::from_value(&value),
             Err(e) => (
                 Self::default(),
                 Some(format!(
@@ -81,6 +76,109 @@ impl Settings {
                 )),
             ),
         }
+    }
+
+    pub fn from_value(value: &Value) -> (Self, Option<String>) {
+        if value.is_null() {
+            return (Self::default(), None);
+        }
+        let Some(obj) = value.as_object() else {
+            return (
+                Self::default(),
+                Some("plugin settings are invalid (expected an object); using defaults".into()),
+            );
+        };
+        let mut settings = Self::default();
+        if let Some(cmd) = obj.get("command") {
+            match cmd {
+                Value::Array(items) => {
+                    let mut argv = Vec::with_capacity(items.len());
+                    for item in items {
+                        let Some(s) = item.as_str() else {
+                            return (
+                                Self::default(),
+                                Some("plugin settings are invalid (`command` items must be strings); using defaults".into()),
+                            );
+                        };
+                        argv.push(s.to_string());
+                    }
+                    settings.command = argv;
+                }
+                Value::String(text) => {
+                    let argv: Vec<String> = text.split_whitespace().map(str::to_string).collect();
+                    if !argv.is_empty() {
+                        settings.command = argv;
+                    }
+                }
+                _ => {
+                    return (
+                        Self::default(),
+                        Some("plugin settings are invalid (`command` must be a list or string); using defaults".into()),
+                    );
+                }
+            }
+        }
+        if let Some(env_val) = obj.get("env") {
+            match serde_json::from_value::<BTreeMap<String, String>>(env_val.clone()) {
+                Ok(env) => settings.env = env,
+                Err(e) => {
+                    return (
+                        Self::default(),
+                        Some(format!("plugin settings are invalid (`env`: {e}); using defaults")),
+                    );
+                }
+            }
+        }
+        if let Some(cache) = obj.get("cache_dir") {
+            match cache {
+                Value::Null => settings.cache_dir = None,
+                Value::String(s) => {
+                    let trimmed = s.trim();
+                    settings.cache_dir = if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    };
+                }
+                _ => {
+                    return (
+                        Self::default(),
+                        Some("plugin settings are invalid (`cache_dir` must be a string); using defaults".into()),
+                    );
+                }
+            }
+        }
+        if let Some(v) = obj.get("call_timeout_secs").and_then(json_u64) {
+            settings.call_timeout_secs = v;
+        }
+        if let Some(v) = obj.get("start_timeout_secs").and_then(json_u64) {
+            settings.start_timeout_secs = v;
+        }
+        if let Some(v) = obj.get("max_output_bytes").and_then(json_u64) {
+            settings.max_output_bytes = v as usize;
+        }
+        if let Some(v) = obj.get("max_active_jobs").and_then(json_u64) {
+            settings.max_active_jobs = v as usize;
+        }
+        (settings.normalized(), None)
+    }
+
+    pub fn merge_env_and_rpc(env: Value, rpc: BTreeMap<String, Value>) -> Value {
+        let mut map = match env {
+            Value::Object(obj) => obj,
+            _ => serde_json::Map::new(),
+        };
+        let default_cmd = DEFAULT_COMMAND.join(" ");
+        for (k, v) in rpc {
+            if k == "command"
+                && v.as_str().is_some_and(|s| s.trim() == default_cmd)
+                && map.get("command").is_some_and(Value::is_array)
+            {
+                continue;
+            }
+            map.insert(k, v);
+        }
+        Value::Object(map)
     }
 
     pub fn normalized(mut self) -> Self {
@@ -109,6 +207,15 @@ impl Settings {
     pub fn command_line(&self) -> String {
         self.command.join(" ")
     }
+}
+
+fn json_u64(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_f64()
+            .filter(|f| f.is_finite() && *f >= 0.0 && *f <= u64::MAX as f64)
+            .map(|f| f.round() as u64)
+    })
 }
 
 #[cfg(test)]

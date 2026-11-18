@@ -1,0 +1,26 @@
+[package]
+name = "discord-presence"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "karucode plugin: mirror what karucode is doing into a Discord channel through a webhook"
+
+[[bin]]
+name = "discord-presence"
+path = "src/main.rs"
+
+# The SDK is vendored in src/sdk.rs and src/protocol.rs, so nothing here points
+# into a karucode checkout or at a published karucode crate. Refresh both with
+# `karucode plugin sdk .` after upgrading karucode.
+#
+# `rusqlite` (against the system sqlite) reads karucode's own database, which is
+# what makes this plugin work with no API key. `ureq` (rustls TLS) is the Discord
+# webhook client; Discord is HTTPS-only, so a TLS stack is not optional.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["tls", "json", "charset"] }
+rusqlite = { version = "0.31", default-features = false }
+
+[profile.release]
+strip = true

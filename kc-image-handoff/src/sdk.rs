@@ -13,9 +13,12 @@ pub use crate::protocol::PluginUiActionResult as UiActionResult;
 pub use crate::protocol::PluginUiContribution as UiContribution;
 
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 /// One `tools/call` invocation handed to a tool handler.
 pub struct ToolRequest {
@@ -104,6 +107,9 @@ pub struct UiActionRequest {
     pub project: Option<String>,
     /// Absolute path of the project root the click belongs to.
     pub workspace: String,
+    /// The text typed after a slash command, when this action was run from the
+    /// composer (§R3) rather than from a clicked control. Empty for a click.
+    pub args: String,
 }
 
 /// Constructors for [`PluginToolResult`].
@@ -360,53 +366,409 @@ pub fn notify_with(frame: NotifyFrame) -> std::io::Result<()> {
     stdout.flush()
 }
 
+/// A request/response channel back to the host (§R2).
+///
+/// The plugin normally only *answers*; this is how it *asks*. `plugin/state/*` is
+/// the first such call: a plugin keeps durable data without a database of its
+/// own. The host answers on the same stdout the plugin writes to, so the client
+/// installs a router that hands a frame with an `id` to its waiter instead of a
+/// worker.
+///
+/// One global client, because there is one stdout. Cheap to clone and safe to
+/// call from any handler thread; a call from inside a tool handler is the normal
+/// case.
+#[derive(Clone, Default)]
+pub struct HostClient {
+    inner: Arc<HostClientInner>,
+}
+
+#[derive(Default)]
+struct HostClientInner {
+    next_id: AtomicU64,
+    pending: Mutex<HashMap<u64, mpsc::Sender<Value>>>,
+    /// Set once the plugin has started serving, so a client created inside a
+    /// handler can still reach the installed router.
+    started: AtomicBool,
+    /// The SDK's one stdout writer. A frame this plugin SENDS goes through the
+    /// same channel its replies use: a second writer on stdout would interleave
+    /// half-lines with the first and, worse, block the reader loop that is
+    /// waiting to hand us the answer.
+    writer: Mutex<Option<mpsc::Sender<Value>>>,
+}
+
+impl std::fmt::Debug for HostClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostClient").finish()
+    }
+}
+
+impl HostClient {
+    /// The process-wide client.
+    pub fn global() -> Self {
+        static CLIENT: OnceLock<HostClient> = OnceLock::new();
+        CLIENT.get_or_init(HostClient::default).clone()
+    }
+
+    /// Whether the host is reachable (i.e. this plugin is being served).
+    pub fn is_live(&self) -> bool {
+        self.inner.started.load(Ordering::SeqCst)
+    }
+
+    /// Send one request and wait for its answer, up to `timeout`.
+    ///
+    /// Returns the JSON-RPC `result` on success, and the error *message* on a
+    /// JSON-RPC error - so a caller can put it in a tool result verbatim instead
+    /// of guessing what went wrong.
+    pub fn call(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, String> {
+        // Our ids carry `PLUGIN_REQUEST_FLAG`, so they can never equal an id the
+        // host allocated for its own request (it counts up from 1). The host echoes
+        // ours on the reply; without the flag the two id spaces collide on the very
+        // first call, and a reply is delivered to the wrong waiter.
+        let id = (self.inner.next_id.fetch_add(1, Ordering::SeqCst) + 1) & !PLUGIN_REQUEST_FLAG
+            | PLUGIN_REQUEST_FLAG;
+        let (tx, rx) = mpsc::channel();
+        if let Ok(mut pending) = self.inner.pending.lock() {
+            pending.insert(id, tx);
+        }
+        let frame = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        // A send failure means the writer is gone (host closed the pipe): the
+        // plugin is being stopped, and the caller should hear that rather than
+        // wait for a timeout.
+        let sender = self.inner.writer.lock().ok().and_then(|w| w.clone());
+        if sender.is_none() {
+            if let Ok(mut pending) = self.inner.pending.lock() {
+                pending.remove(&id);
+            }
+            return Err("the host is not reachable: this plugin is not running".to_string());
+        }
+        if let Err(e) = sender.expect("checked above").send(frame) {
+            if let Ok(mut pending) = self.inner.pending.lock() {
+                pending.remove(&id);
+            }
+            return Err(format!("could not reach the host: {e}"));
+        }
+        let answer = rx.recv_timeout(timeout);
+        if let Ok(mut pending) = self.inner.pending.lock() {
+            pending.remove(&id);
+        }
+        match answer {
+            Ok(value) => {
+                if let Some(error) = value.get("error") {
+                    let message = error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("the host refused the request");
+                    Err(message.to_string())
+                } else {
+                    Ok(value.get("result").cloned().unwrap_or(Value::Null))
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                Err(format!("the host did not answer `{method}` in time"))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("the host went away before answering".to_string())
+            }
+        }
+    }
+}
+
+/// Typed `plugin/state/*` helpers (§R2).
+///
+/// Thin over [`HostClient::call`]: the shape and the bounds are the host's, and a
+/// plugin should not re-invent them. Every method takes the **scope** explicitly
+/// because "who can see this value" is a design decision, not a default.
+impl HostClient {
+    /// Read one value. `Ok(None)` when nothing is stored.
+    pub fn state_get(
+        &self,
+        scope: &str,
+        session_id: &str,
+        project_id: &str,
+        key: &str,
+    ) -> Result<Option<Value>, String> {
+        let answer = self.call(
+            methods::STATE_GET,
+            state_params(scope, session_id, project_id, key),
+            Duration::from_secs(10),
+        )?;
+        Ok(answer.get("value").cloned().filter(|v| !v.is_null()))
+    }
+
+    /// Write one value (any JSON up to the host's 64 KiB cap).
+    pub fn state_set(
+        &self,
+        scope: &str,
+        session_id: &str,
+        project_id: &str,
+        key: &str,
+        value: Value,
+    ) -> Result<(), String> {
+        let mut params = state_params(scope, session_id, project_id, key);
+        params["value"] = value;
+        self.call(methods::STATE_SET, params, Duration::from_secs(10))?;
+        Ok(())
+    }
+
+    /// Delete one value. `Ok(false)` when there was nothing to delete.
+    pub fn state_delete(
+        &self,
+        scope: &str,
+        session_id: &str,
+        project_id: &str,
+        key: &str,
+    ) -> Result<bool, String> {
+        let answer = self.call(
+            methods::STATE_DELETE,
+            state_params(scope, session_id, project_id, key),
+            Duration::from_secs(10),
+        )?;
+        Ok(answer
+            .get("deleted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
+    }
+
+    /// Every `(key, value)` in one scope, optionally narrowed by a key prefix.
+    pub fn state_list(
+        &self,
+        scope: &str,
+        session_id: &str,
+        project_id: &str,
+        prefix: &str,
+    ) -> Result<Vec<(String, Value)>, String> {
+        let mut params = json!({"scope": scope});
+        let object = params.as_object_mut().expect("json object");
+        if !session_id.is_empty() {
+            object.insert("session_id".into(), json!(session_id));
+        }
+        if !project_id.is_empty() {
+            object.insert("project_id".into(), json!(project_id));
+        }
+        if !prefix.is_empty() {
+            object.insert("prefix".into(), json!(prefix));
+        }
+        let answer = self.call(methods::STATE_LIST, params, Duration::from_secs(10))?;
+        let entries = answer
+            .get("entries")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(entries
+            .into_iter()
+            .filter_map(|entry| {
+                let key = entry.get("key")?.as_str()?.to_string();
+                Some((key, entry.get("value").cloned().unwrap_or(Value::Null)))
+            })
+            .collect())
+    }
+}
+
+/// Read this plugin's **effective settings** (§S2).
+///
+/// The values the operator set in Settings → Plugins & MCP, over the defaults
+/// this plugin's own manifest declared. Read-only by design: a plugin that could
+/// write its settings could quietly switch off a guard rail the operator turned
+/// on, so the call is a read and there is deliberately no `set`.
+///
+/// Call it once at start, and again if you need to notice a change — the host
+/// restarts the plugin when a setting is saved, so a fresh process is the normal
+/// way to see new values. On a host that predates settings this returns an empty
+/// object rather than failing, so a plugin still starts.
+pub fn settings() -> std::collections::BTreeMap<String, Value> {
+    let answer =
+        HostClient::global().call(methods::SETTINGS_GET, json!({}), Duration::from_secs(10));
+    let map = match answer {
+        Ok(value) => value.get("settings").cloned().unwrap_or(Value::Null),
+        Err(error) => {
+            // The usual cause is calling this from `main` before `.run()`: the
+            // loop that carries the conversation is not running, so the host can
+            // never answer. Saying so is far more useful than quietly handing back
+            // defaults that look correct until someone changes a setting.
+            if !HostClient::global().inner.started.load(Ordering::SeqCst) {
+                eprintln!(
+                    "kc-plugin-sdk: settings() was called before the plugin started serving \
+                     (are you calling it from main before .run()?); using defaults. Call it \
+                     from a handler instead."
+                );
+            } else {
+                eprintln!("kc-plugin-sdk: could not read settings ({error}); using defaults");
+            }
+            Value::Null
+        }
+    };
+    map.as_object()
+        .map(|object| {
+            object
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One setting as a `bool`, falling back to `default` when it is absent or of
+/// another type. A settings file edited by hand must not crash a plugin.
+pub fn setting_bool(
+    settings: &std::collections::BTreeMap<String, Value>,
+    key: &str,
+    default: bool,
+) -> bool {
+    settings
+        .get(key)
+        .and_then(Value::as_bool)
+        .unwrap_or(default)
+}
+
+/// One setting as a number, falling back to `default`.
+pub fn setting_number(
+    settings: &std::collections::BTreeMap<String, Value>,
+    key: &str,
+    default: f64,
+) -> f64 {
+    settings.get(key).and_then(Value::as_f64).unwrap_or(default)
+}
+
+/// One setting as a string, falling back to `default`.
+pub fn setting_text<'a>(
+    settings: &'a std::collections::BTreeMap<String, Value>,
+    key: &str,
+    default: &'a str,
+) -> &'a str {
+    settings.get(key).and_then(Value::as_str).unwrap_or(default)
+}
+
+/// The common `plugin/state/*` params, with the ids the host expects.
+fn state_params(scope: &str, session_id: &str, project_id: &str, key: &str) -> Value {
+    let mut params = json!({"scope": scope, "key": key});
+    let object = params.as_object_mut().expect("json object");
+    if !session_id.is_empty() {
+        object.insert("session_id".into(), json!(session_id));
+    }
+    if !project_id.is_empty() {
+        object.insert("project_id".into(), json!(project_id));
+    }
+    params
+}
+
+/// The bit this plugin sets on the ids of the requests **it** sends.
+///
+/// Both sides number their own requests from 1, so an unmarked plugin id can equal
+/// a host id: the host would read the plugin's question as the answer to its own,
+/// and a reply would land on the wrong waiter (a hook that times out while its
+/// answer is logged as "unknown request id"). Marking ours keeps the two id spaces
+/// disjoint, and the host echoes the id verbatim. Mirrors
+/// `kc_plugin_host::PLUGIN_REQUEST_FLAG`.
+pub const PLUGIN_REQUEST_FLAG: u64 = 1 << 62;
+
+/// Route one inbound frame: `true` when it was a response to this plugin's own
+/// request, `false` when it is a job for a worker.
+///
+/// Only a frame carrying [`PLUGIN_REQUEST_FLAG`] is ours. Anything else with an
+/// `id` is a request from the host and belongs to a worker, even if its number
+/// happens to equal one this plugin is waiting on - which is exactly the collision
+/// this flag exists to prevent.
+fn route_inbound(client: &HostClient, value: &Value) -> bool {
+    let Some(raw) = value.get("id").and_then(Value::as_u64) else {
+        return false;
+    };
+    // The host echoes our id verbatim, so the marker it carries is OUR marker.
+    // Anything without it is the host's own request (or a notification) and
+    // belongs to a worker, even if its number happens to equal one we wait on.
+    if raw & PLUGIN_REQUEST_FLAG == 0 {
+        return false;
+    }
+    // No `method` check: the host's answer to `plugin/state/*` is written by the
+    // host, but the SDK's own machinery can echo a frame that still carries the
+    // method, and a `method` here is not evidence of a request.
+    // Keyed by the id EXACTLY as `call` registered it, marker included: stripping
+    // it here and not in `call` is a lookup miss, and the caller waits out its
+    // whole timeout with the answer sitting unread.
+    let waiter = client
+        .inner
+        .pending
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.remove(&raw));
+    match waiter {
+        Some(tx) => {
+            let _ = tx.send(value.clone());
+            true
+        }
+        None => false,
+    }
+}
+
 struct ToolEntry {
     def: PluginToolDef,
     handler: ToolHandler,
 }
 
 /// A plugin assembled by [`PluginBuilder`], ready to serve requests.
+///
+/// The handler tables live behind an `Arc<Mutex>` so [`Plugin::run`] can serve
+/// requests concurrently: a tool call that takes a minute must not stop the
+/// plugin answering a panel read or a hook. The host multiplexes requests by
+/// JSON-RPC id, so replies may arrive in any order.
 pub struct Plugin {
+    tables: Arc<Tables>,
+    /// Set as soon as `shutdown` is handled; the run loop exits after draining.
+    shutdown: Arc<AtomicBool>,
+}
+
+/// Everything the host can call. Immutable after [`PluginBuilder::build`]:
+/// handlers are shared, so a request that takes a minute never blocks another.
+struct Tables {
     manifest: PluginManifest,
     tools: BTreeMap<String, ToolEntry>,
     hooks: BTreeMap<String, HookHandler>,
     panels: BTreeMap<String, PanelHandler>,
     ui_actions: BTreeMap<String, UiActionHandler>,
-    shutdown: bool,
 }
 
 impl Plugin {
     /// Manifest reported to the host by `initialize`.
-    pub fn manifest(&self) -> &PluginManifest {
-        &self.manifest
+    pub fn manifest(&self) -> PluginManifest {
+        self.tables.manifest.clone()
     }
 
     /// True once a `shutdown` request was handled.
     pub fn is_shutdown(&self) -> bool {
-        self.shutdown
+        self.shutdown.load(Ordering::SeqCst)
     }
 
     /// Handle one decoded JSON-RPC message.
     ///
     /// Returns the response object for requests, and `None` for notifications
     /// (no `id`). This is the whole protocol surface; [`Plugin::run`] is just
-    /// stdin/stdout plumbing around it.
-    pub fn handle_request(&mut self, request: Value) -> Option<Value> {
+    /// stdin/stdout plumbing around it. Safe to call from any thread; the
+    /// handler tables are behind a lock held only for the duration of one
+    /// handler (and never across a handler's own back-call, if it has one).
+    pub fn handle_request(&self, request: Value) -> Option<Value> {
         let id = request.get("id").cloned();
-        let method = request
-            .get("method")
-            .and_then(|m| m.as_str())
-            .unwrap_or_default()
-            .to_string();
+        // A frame with no `method` is a RESPONSE, not a request: it is the host
+        // answering a call this plugin made. Answering it back is at best noise and
+        // at worst an infinite ping-pong, so it is never handled here. (`route_inbound`
+        // consumes ours first; this is the belt to that braces.)
+        let method = request.get("method").and_then(|m| m.as_str())?.to_string();
         let params = request.get("params").cloned().unwrap_or(Value::Null);
 
         // Notifications (e.g. `notifications/initialized`) get no response.
         let id = id?;
 
+        // `shutdown` is answered inline and needs no tables; the flag is what
+        // the run loop drains on.
+        if method == methods::SHUTDOWN {
+            self.shutdown.store(true, Ordering::SeqCst);
+            return Some(json!({"jsonrpc": "2.0", "id": id, "result": Value::Null}));
+        }
+
+        let state = &*self.tables;
         let response = match method.as_str() {
-            methods::INITIALIZE => Ok(json!(self.manifest)),
+            methods::INITIALIZE => Ok(json!(state.manifest.clone())),
             methods::TOOLS_LIST => {
-                let list: Vec<PluginToolDef> = self.tools.values().map(|t| t.def.clone()).collect();
+                let list: Vec<PluginToolDef> =
+                    state.tools.values().map(|t| t.def.clone()).collect();
                 Ok(json!({ "tools": list }))
             }
             methods::TOOLS_CALL => {
@@ -425,7 +787,7 @@ impl Plugin {
                     .get("context")
                     .cloned()
                     .and_then(|value| serde_json::from_value(value).ok());
-                match self.tools.get(&name) {
+                match state.tools.get(&name) {
                     Some(entry) => {
                         match user_handler("tool", &name, || {
                             (entry.handler)(ToolRequest {
@@ -466,10 +828,10 @@ impl Plugin {
                         .unwrap_or_default()
                         .to_string(),
                 };
-                match self.panels.get(&panel) {
+                match state.panels.get(&panel) {
                     Some(handler) => match user_handler("panel", &panel, || handler(request)) {
                         Ok(data) => Ok(json!({
-                            "title": self
+                            "title": state
                                 .manifest
                                 .panels
                                 .iter()
@@ -494,7 +856,7 @@ impl Plugin {
                     .unwrap_or_default()
                     .to_string();
                 let payload = params.get("payload").cloned().unwrap_or(Value::Null);
-                match self.hooks.get(&hook) {
+                match state.hooks.get(&hook) {
                     Some(handler) => match user_handler("hook", &hook, || handler(payload)) {
                         Ok(output) => Ok(json!({ "output": output })),
                         Err(error) => Err(error),
@@ -509,7 +871,7 @@ impl Plugin {
                     .unwrap_or_default()
                     .to_string();
                 let contribution = params.get("contribution").cloned().unwrap_or(Value::Null);
-                match self.ui_actions.get(&action) {
+                match state.ui_actions.get(&action) {
                     Some(handler) => {
                         let request = UiActionRequest {
                             action: action.clone(),
@@ -527,6 +889,7 @@ impl Plugin {
                                 .and_then(|v| v.as_str())
                                 .map(str::to_string),
                             workspace: string_of(&params, "workspace"),
+                            args: string_of(&params, "args"),
                         };
                         match user_handler("ui action", &action, || handler(request)) {
                             Ok(result) => serde_json::to_value(result).map_err(|e| {
@@ -546,10 +909,6 @@ impl Plugin {
                     )),
                 }
             }
-            methods::SHUTDOWN => {
-                self.shutdown = true;
-                Ok(Value::Null)
-            }
             other => Err(PluginError::new(
                 -32601,
                 format!("unknown method `{other}`"),
@@ -563,15 +922,127 @@ impl Plugin {
     }
 
     /// Serve requests on stdin/stdout until EOF or `shutdown`.
-    pub fn run(&mut self) -> std::io::Result<()> {
+    ///
+    /// Requests are handled **concurrently** on a small bounded pool, and every
+    /// reply is written by one dedicated writer thread. The host multiplexes
+    /// every plugin interaction by JSON-RPC id and waits per request, so a slow
+    /// tool call (a vision handoff, a research sweep) must not stop the plugin
+    /// answering the panel reads, hooks and status calls that arrive meanwhile:
+    /// a plugin that blocks reads as "not reading its stdin" on the host side
+    /// and gets killed - which is how a panel 502 and a broken tool call happen
+    /// together.
+    ///
+    /// Ordering rules:
+    ///
+    /// * `shutdown` is answered on whichever worker serves it; the run loop
+    ///   then drains in-flight work before exiting, so a request that raced the
+    ///   shutdown still gets its reply.
+    /// * A parse error is reported with id `null` and the loop continues.
+    /// * At most [`RUN_WORKERS`] requests run at once; the rest queue in the
+    ///   job channel, so a flood cannot spawn unbounded threads.
+    pub fn run(&self) -> std::io::Result<()> {
         let stdin = std::io::stdin();
-        let mut stdout = std::io::stdout();
         let mut reader = stdin.lock();
         let mut line = String::new();
+
+        // Workers pull jobs and hand replies to the writer thread. Only the
+        // writer touches stdout, so replies never interleave and never wait
+        // behind the reader (which may be blocked in `read_line`).
+        let (job_tx, job_rx) = mpsc::channel::<Job>();
+        let job_rx = Arc::new(Mutex::new(job_rx));
+        let (reply_tx, reply_rx) = mpsc::channel::<Value>();
+        let (write_tx, write_rx) = mpsc::channel::<Value>();
+        let writer = std::thread::Builder::new()
+            .name("plugin-writer".into())
+            .spawn(move || {
+                let mut stdout = std::io::stdout();
+                let mut ok = true;
+                while let Ok(reply) = write_rx.recv() {
+                    if writeln!(stdout, "{reply}")
+                        .and_then(|_| stdout.flush())
+                        .is_err()
+                    {
+                        ok = false;
+                        break;
+                    }
+                }
+                ok
+            })
+            .expect("spawn the plugin writer thread");
+
+        // Workers hand replies to `reply_tx`, and this thread moves them to the
+        // writer the moment they exist. Without it the replies sat in the channel
+        // until EOF and a live plugin never answered its host at all: the host saw
+        // every `initialize` handshake time out after ten seconds.
+        let pump_finished = Arc::new(AtomicBool::new(false));
+        let pump_stop = Arc::new(AtomicBool::new(false));
+        // From here on the host is reachable: a handler may call back into it
+        // (`plugin/state/*`, §R2) and the reader loop routes the answer.
+        {
+            let client = HostClient::global();
+            if let Ok(mut slot) = client.inner.writer.lock() {
+                *slot = Some(write_tx.clone());
+            }
+            client.inner.started.store(true, Ordering::SeqCst);
+        }
+        let pump = {
+            let out = write_tx.clone();
+            let finished = Arc::clone(&pump_finished);
+            let stop = Arc::clone(&pump_stop);
+            std::thread::Builder::new()
+                .name("plugin-replies".into())
+                .spawn(move || {
+                    loop {
+                        // A tick, not a blocking receive: the loop has to notice
+                        // `stop` after a worker that never returns, so a shut-down
+                        // plugin cannot outlive its host.
+                        match reply_rx.recv_timeout(REPLY_TICK) {
+                            Ok(reply) => {
+                                if out.send(reply).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                if stop.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                            }
+                            // Every worker is gone, so nothing more can arrive.
+                            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                    finished.store(true, Ordering::SeqCst);
+                })
+                .expect("spawn the plugin reply thread")
+        };
+
+        for _ in 0..RUN_WORKERS {
+            let jobs = Arc::clone(&job_rx);
+            let replies = reply_tx.clone();
+            let plugin = Plugin {
+                tables: Arc::clone(&self.tables),
+                shutdown: Arc::clone(&self.shutdown),
+            };
+            std::thread::Builder::new()
+                .name("plugin-worker".into())
+                .spawn(move || loop {
+                    // Take the job under the lock, run it without the lock.
+                    let job = match jobs.lock().unwrap_or_else(|p| p.into_inner()).recv() {
+                        Ok(job) => job,
+                        Err(_) => return, // The loop is done.
+                    };
+                    if let Some(reply) = plugin.handle_request(job.request) {
+                        let _ = replies.send(reply);
+                    }
+                })
+                .expect("spawn a plugin worker");
+        }
+        drop(reply_tx); // Only the workers hold the reply channel now.
+
         loop {
             line.clear();
             if reader.read_line(&mut line)? == 0 {
-                return Ok(());
+                break;
             }
             let trimmed = line.trim();
             if trimmed.is_empty() {
@@ -587,22 +1058,74 @@ impl Plugin {
                         "id": null,
                         "error": {"code": -32700, "message": format!("parse error: {e}")},
                     });
-                    writeln!(stdout, "{error}")?;
-                    stdout.flush()?;
+                    write_tx.send(error).map_err(std::io::Error::other)?;
                     continue;
                 }
             };
-            let response = self.handle_request(request);
-            if let Some(response) = response {
-                writeln!(stdout, "{response}")?;
-                stdout.flush()?;
+            // A frame with an `id` and no `method` is the host answering a
+            // request THIS plugin made (`plugin/state/*`, §R2). Route it to its
+            // waiter instead of queueing it as a job; a job would have no reply
+            // table entry and the caller would sit until its timeout.
+            if route_inbound(&HostClient::global(), &request) {
+                continue;
             }
-            if self.shutdown {
-                return Ok(());
+            let is_shutdown =
+                request.get("method").and_then(Value::as_str) == Some(methods::SHUTDOWN);
+            if is_shutdown {
+                self.shutdown.store(true, Ordering::SeqCst);
+            }
+            job_tx
+                .send(Job { request })
+                .map_err(std::io::Error::other)?;
+            if is_shutdown || self.shutdown.load(Ordering::SeqCst) {
+                break;
             }
         }
+        // EOF or shutdown. Stop taking work, give the workers `SHUTDOWN_GRACE` to
+        // finish what they hold - their replies still reach the writer through the
+        // pump - then unwind: stopping the pump closes the writer's channel.
+        drop(job_tx);
+        let drain_until = std::time::Instant::now() + SHUTDOWN_GRACE;
+        while !pump_finished.load(Ordering::SeqCst) && std::time::Instant::now() < drain_until {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        pump_stop.store(true, Ordering::SeqCst);
+        let _ = pump.join();
+        {
+            let client = HostClient::global();
+            client.inner.started.store(false, Ordering::SeqCst);
+            if let Ok(mut slot) = client.inner.writer.lock() {
+                *slot = None;
+            };
+        }
+        drop(write_tx);
+        let wrote_everything = writer.join().unwrap_or(false);
+        if !wrote_everything {
+            return Err(std::io::Error::other(
+                "stdout closed while writing a plugin reply",
+            ));
+        }
+        Ok(())
     }
 }
+
+/// One request handed to a worker.
+struct Job {
+    request: Value,
+}
+
+/// How many requests may run at once. A plugin is a small local process; more
+/// threads than this buy nothing, and the host caps concurrency itself.
+const RUN_WORKERS: usize = 8;
+
+/// How long the run loop waits for in-flight work after EOF or `shutdown`.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often the reply pump looks at its stop flag while it has nothing to write.
+///
+/// Short enough that a shut-down plugin exits promptly even when a worker is
+/// wedged, long enough that an idle plugin does not spin.
+const REPLY_TICK: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Builds a [`Plugin`]: declares the manifest, the tools and the hooks.
 pub struct PluginBuilder {
@@ -630,12 +1153,39 @@ impl PluginBuilder {
                 tool_prefix: None,
                 panels: Vec::new(),
                 ui: Vec::new(),
+                settings: Vec::new(),
             },
             tools: BTreeMap::new(),
             hooks: BTreeMap::new(),
             panels: BTreeMap::new(),
             ui_actions: BTreeMap::new(),
         }
+    }
+
+    /// Declare a setting the operator can edit in Settings → Plugins & MCP.
+    ///
+    /// The declaration is a promise: the operator will be offered this field, so
+    /// the host checks it (type, bounds, unique key) before the plugin is marked
+    /// ready. Read the value back with [`settings`] and the typed accessors.
+    ///
+    /// ```rust
+    /// use kc_plugin_sdk::PluginBuilder;
+    /// use crate::protocol::{PluginSetting, PluginSettingKind};
+    ///
+    /// let plugin = PluginBuilder::new("mine", "0.1.0").setting(PluginSetting {
+    ///     key: "collapse_completed".into(),
+    ///     label: "Collapse completed sessions".into(),
+    ///     kind: PluginSettingKind::Bool,
+    ///     default: serde_json::json!(true),
+    ///     help: "Finished sessions fold into a group at the bottom.".into(),
+    ///     min: None,
+    ///     max: None,
+    ///     options: Vec::new(),
+    /// });
+    /// ```
+    pub fn setting(mut self, setting: crate::protocol::PluginSetting) -> Self {
+        self.manifest.settings.push(setting);
+        self
     }
 
     /// Human-readable description shown in diagnostics.
@@ -893,6 +1443,11 @@ impl PluginBuilder {
             message: None,
             keys: None,
             target: None,
+            text: None,
+            tone: None,
+            summary: None,
+            sets: Vec::new(),
+            replace: None,
         })
     }
 
@@ -913,6 +1468,11 @@ impl PluginBuilder {
             message: Some(message.to_string()),
             keys: None,
             target: None,
+            text: None,
+            tone: None,
+            summary: None,
+            sets: Vec::new(),
+            replace: None,
         })
     }
 
@@ -955,6 +1515,153 @@ impl PluginBuilder {
             message: None,
             keys: None,
             target: None,
+            text: None,
+            tone: None,
+            summary: None,
+            sets: Vec::new(),
+            replace: None,
+        })
+    }
+
+    /// Gate every tool call: block it, or rewrite its arguments (§R1).
+    ///
+    /// The handler receives `{session_id, run_id, tool, class, origin, arguments}`.
+    /// Return:
+    ///
+    /// * `json!({"block": true, "reason": "…"})` — the tool never runs, and the
+    ///   reason becomes the result the model reads;
+    /// * `json!({"arguments": {…}})` — run the call with different arguments,
+    ///   which the harness re-validates against the tool's own schema;
+    /// * anything else, or `null` — run the call as written.
+    ///
+    /// A gate can never approve a call the approval policy would have asked
+    /// about: it narrows, it does not permit. A handler that panics or hangs is
+    /// treated as "allow", so a broken gate cannot brick a session.
+    pub fn on_tool_call(self, handler: impl Fn(Value) -> Value + Send + Sync + 'static) -> Self {
+        self.capability("hooks").hook("on_tool_call", handler)
+    }
+
+    /// Rewrite a tool result before the model sees it (§R1).
+    ///
+    /// Receive `{session_id, run_id, tool, ok, output, truncated}` and return
+    /// `json!({"output": "…"})` to replace the text, or `null` to keep it. The
+    /// replacement is truncated to the tool's own output budget, so this hook can
+    /// summarise or redact but never enlarge the context.
+    pub fn on_tool_result_gate(
+        self,
+        handler: impl Fn(Value) -> Value + Send + Sync + 'static,
+    ) -> Self {
+        self.capability("hooks").hook("on_tool_result", handler)
+    }
+
+    /// Append text to the system prompt for one request (§R1).
+    ///
+    /// Receive `{session_id, run_id, system, messages, tools}` and return a
+    /// string (or `json!({"text": "…"})`). The assembled prompt cannot be
+    /// replaced, only added to, and the addition is capped at 4 KiB in total
+    /// across plugins.
+    pub fn on_model_request(
+        self,
+        handler: impl Fn(Value) -> Value + Send + Sync + 'static,
+    ) -> Self {
+        self.capability("hooks").hook("on_model_request", handler)
+    }
+
+    /// Asked when a run is about to end: may it stop? (§R1)
+    ///
+    /// Receive `{session_id, run_id, status, continuations, max_continuations}`
+    /// and return
+    /// `json!({"continue": true, "reason": "this session is still open"})` to keep
+    /// going for one more turn. `limits.max_stop_continuations` (3 by default)
+    /// bounds how many times any plugin may do this per run.
+    pub fn on_stop(self, handler: impl Fn(Value) -> Value + Send + Sync + 'static) -> Self {
+        self.capability("hooks").hook("on_stop", handler)
+    }
+
+    /// Shape how the session rail draws its rows (§R4).
+    ///
+    /// Receive `{project_id, sessions: [{id, title, updated_at, status}]}` and
+    /// return `{"sessions": [{id, group?, sort_key?, badges?}]}`. Display only: an
+    /// id the host did not list is dropped, and nothing can hide a session.
+    pub fn on_session_list(self, handler: impl Fn(Value) -> Value + Send + Sync + 'static) -> Self {
+        self.capability("hooks")
+            .hook("before_session_list", handler)
+    }
+
+    /// Contribute a **chip** — a small coloured label with an action — into a
+    /// badge slot (`session.row.badge`, `session.header.chip`).
+    ///
+    /// A chip differs from a button only in what it draws: `text` plus a `tone`
+    /// instead of a label plus an icon. It carries exactly one `action` (or one
+    /// `message`), so it is still a control a person activates, never markup.
+    /// `title` is the tooltip, and the accessible name falls back to `text`.
+    pub fn chip_with(
+        self,
+        slot: &str,
+        id: &str,
+        text: &str,
+        tone: &str,
+        title: Option<&str>,
+        handler: impl Fn(UiActionRequest) -> PluginUiActionResult + Send + Sync + 'static,
+    ) -> Self {
+        self.chip_command(slot, id, text, tone, title, handler)
+    }
+
+    /// A chip that sends a user turn instead of running code.
+    pub fn message_chip(
+        self,
+        slot: &str,
+        id: &str,
+        text: &str,
+        tone: &str,
+        title: Option<&str>,
+        message: &str,
+    ) -> Self {
+        self.ui(PluginUiContribution {
+            kind: UI_KIND_BUTTON.to_string(),
+            id: id.to_string(),
+            slot: Some(slot.to_string()),
+            label: text.to_string(),
+            title: title.map(str::to_string),
+            icon: None,
+            action: None,
+            message: Some(message.to_string()),
+            keys: None,
+            target: None,
+            text: Some(text.to_string()),
+            tone: Some(tone.to_string()),
+            summary: None,
+            sets: Vec::new(),
+            replace: None,
+        })
+    }
+
+    fn chip_command(
+        mut self,
+        slot: &str,
+        id: &str,
+        text: &str,
+        tone: &str,
+        title: Option<&str>,
+        handler: impl Fn(UiActionRequest) -> PluginUiActionResult + Send + Sync + 'static,
+    ) -> Self {
+        self.ui_actions.insert(id.to_string(), Box::new(handler));
+        self.ui(PluginUiContribution {
+            kind: UI_KIND_BUTTON.to_string(),
+            id: id.to_string(),
+            slot: Some(slot.to_string()),
+            label: text.to_string(),
+            title: title.map(str::to_string),
+            icon: None,
+            action: Some(id.to_string()),
+            message: None,
+            keys: None,
+            target: None,
+            text: Some(text.to_string()),
+            tone: Some(tone.to_string()),
+            summary: None,
+            sets: Vec::new(),
+            replace: None,
         })
     }
 
@@ -971,6 +1678,11 @@ impl PluginBuilder {
             message: Some(message.to_string()),
             keys: None,
             target: None,
+            text: None,
+            tone: None,
+            summary: None,
+            sets: Vec::new(),
+            replace: None,
         })
     }
 
@@ -1014,6 +1726,11 @@ impl PluginBuilder {
             message: None,
             keys: Some(keys.to_string()),
             target: None,
+            text: None,
+            tone: None,
+            summary: None,
+            sets: Vec::new(),
+            replace: None,
         })
     }
 
@@ -1031,6 +1748,11 @@ impl PluginBuilder {
             message: Some(message.to_string()),
             keys: Some(keys.to_string()),
             target: None,
+            text: None,
+            tone: None,
+            summary: None,
+            sets: Vec::new(),
+            replace: None,
         })
     }
 
@@ -1071,12 +1793,14 @@ impl PluginBuilder {
     /// Finish building without serving.
     pub fn build(self) -> Plugin {
         Plugin {
-            manifest: self.manifest,
-            tools: self.tools,
-            hooks: self.hooks,
-            panels: self.panels,
-            ui_actions: self.ui_actions,
-            shutdown: false,
+            tables: Arc::new(Tables {
+                manifest: self.manifest,
+                tools: self.tools,
+                hooks: self.hooks,
+                panels: self.panels,
+                ui_actions: self.ui_actions,
+            }),
+            shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1089,6 +1813,123 @@ impl PluginBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two id spaces must stay disjoint, in both directions.
+    ///
+    /// This is the bug that cost the most to find: both sides numbered their own
+    /// requests from 1, so a plugin's first `plugin/state/*` call aliased the
+    /// host's own request, the host read the question as its answer, and a hook
+    /// timed out while its reply was logged as "unknown request id". The rules
+    /// pinned here are what keeps that from coming back.
+    #[test]
+    fn plugin_request_ids_never_collide_with_host_ids() {
+        let client = HostClient::global();
+        // What `call` allocates: the counter with the marker set.
+        let marked = |n: u64| (n & !PLUGIN_REQUEST_FLAG) | PLUGIN_REQUEST_FLAG;
+        assert_eq!(marked(1), PLUGIN_REQUEST_FLAG | 1);
+        // A host id (1, 2, 3...) never carries the marker, however many it makes.
+        for host_id in 1..1_000u64 {
+            assert_eq!(host_id & PLUGIN_REQUEST_FLAG, 0);
+            assert_ne!(host_id, marked(host_id));
+        }
+        // The client's own counter produces marked ids only.
+        client.inner.next_id.store(0, Ordering::SeqCst);
+        let first = (client.inner.next_id.fetch_add(1, Ordering::SeqCst) + 1)
+            & !PLUGIN_REQUEST_FLAG
+            | PLUGIN_REQUEST_FLAG;
+        assert_ne!(first & PLUGIN_REQUEST_FLAG, 0);
+    }
+
+    /// A frame with the marker is a reply only when a waiter registered it; a
+    /// frame without it is always a request for a worker, never a reply - even
+    /// when its number happens to equal one this plugin is waiting on.
+    #[test]
+    fn an_unmarked_frame_is_never_taken_as_our_reply() {
+        let client = HostClient::global();
+        client.inner.next_id.store(0, Ordering::SeqCst);
+        let pending_id = (client.inner.next_id.fetch_add(1, Ordering::SeqCst) + 1)
+            & !PLUGIN_REQUEST_FLAG
+            | PLUGIN_REQUEST_FLAG;
+        let (tx, rx) = mpsc::channel();
+        client.inner.pending.lock().unwrap().insert(pending_id, tx);
+
+        // The host's own request that happens to use the same number.
+        let host_request = json!({"jsonrpc": "2.0", "id": pending_id & !PLUGIN_REQUEST_FLAG,
+                                  "method": "hooks/run", "params": {}});
+        assert!(
+            !route_inbound(&client, &host_request),
+            "an unmarked id must never satisfy our waiter"
+        );
+        // The real answer, marked, does.
+        let answer = json!({"jsonrpc": "2.0", "id": pending_id, "result": {"value": 7}});
+        assert!(route_inbound(&client, &answer));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap()["result"]["value"],
+            7
+        );
+        assert!(client.inner.pending.lock().unwrap().is_empty());
+    }
+
+    /// A frame with no `method` is a response, and answering it back is how a
+    /// plugin ends up in a ping-pong with its own host.
+    #[test]
+    fn a_response_is_never_answered() {
+        let plugin = Plugin {
+            tables: Arc::new(Tables {
+                manifest: PluginBuilder::new("t", "1").manifest.clone(),
+                tools: BTreeMap::new(),
+                hooks: BTreeMap::new(),
+                panels: BTreeMap::new(),
+                ui_actions: BTreeMap::new(),
+            }),
+            shutdown: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(plugin
+            .handle_request(json!({"jsonrpc": "2.0", "id": 9, "result": {"ok": true}}))
+            .is_none());
+        // A real request still is answered.
+        assert!(plugin
+            .handle_request(json!({"jsonrpc": "2.0", "id": 9,
+                                   "method": methods::SHUTDOWN, "params": {}}))
+            .is_some());
+    }
+
+    /// A latch the test opens from another thread: the `slow` tool waits on it.
+    type Latch = std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+
+    fn latch() -> Latch {
+        std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()))
+    }
+
+    fn wait_latch(l: &Latch) {
+        let (lock, cvar) = &**l;
+        let mut open = lock.lock().unwrap();
+        while !*open {
+            open = cvar.wait(open).unwrap();
+        }
+    }
+
+    fn open_latch(l: &Latch) {
+        let (lock, cvar) = &**l;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+
+    /// A plugin with a `slow` tool that blocks on `latch` and an `echo` tool,
+    /// for the concurrency contract test.
+    fn plugin_with_slow_tool(latch: Latch) -> Plugin {
+        PluginBuilder::new("slow", "1.0")
+            .tool(
+                "slow",
+                "Blocks until the latch opens.",
+                json!({"type": "object"}),
+                move |_req| {
+                    wait_latch(&latch);
+                    PluginToolResult::ok("slow done")
+                },
+            )
+            .build()
+    }
 
     fn plugin() -> Plugin {
         PluginBuilder::new("demo", "1.2.3")
@@ -1122,7 +1963,7 @@ mod tests {
 
     #[test]
     fn initialize_returns_the_manifest() {
-        let mut plugin = plugin();
+        let plugin = plugin();
         let response = plugin
             .handle_request(json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
                                    "params": {"protocol": "1"}}))
@@ -1133,7 +1974,7 @@ mod tests {
 
     #[test]
     fn tools_list_is_sorted_and_stable() {
-        let mut plugin = plugin();
+        let plugin = plugin();
         let response = plugin
             .handle_request(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
             .unwrap();
@@ -1151,7 +1992,7 @@ mod tests {
 
     #[test]
     fn tools_call_success_and_failure() {
-        let mut plugin = plugin();
+        let plugin = plugin();
         let ok = plugin
             .handle_request(json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                                    "params": {"name": "echo", "arguments": {"text": "hi"}}}))
@@ -1169,7 +2010,7 @@ mod tests {
 
     #[test]
     fn unknown_tool_and_method_are_jsonrpc_errors() {
-        let mut plugin = plugin();
+        let plugin = plugin();
         let unknown_tool = plugin
             .handle_request(json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call",
                                    "params": {"name": "nope", "arguments": {}}}))
@@ -1188,7 +2029,7 @@ mod tests {
 
     #[test]
     fn ui_contributions_are_declared_and_dispatched() {
-        let mut plugin = PluginBuilder::new("uidemo", "1.0.0")
+        let plugin = PluginBuilder::new("uidemo", "1.0.0")
             .button_with(
                 "composer.toolbar",
                 "go",
@@ -1256,7 +2097,7 @@ mod tests {
 
     #[test]
     fn a_ui_action_that_panics_is_an_rpc_error_and_the_plugin_survives() {
-        let mut plugin = PluginBuilder::new("uidemo", "1.0.0")
+        let plugin = PluginBuilder::new("uidemo", "1.0.0")
             .button("composer.toolbar", "bad", "Bad", |_req| panic!("boom"))
             .button("composer.toolbar", "good", "Good", |_req| {
                 UiActionResult::ok("still here")
@@ -1316,7 +2157,7 @@ mod tests {
 
     #[test]
     fn an_on_ui_action_handler_can_serve_two_contributions() {
-        let mut plugin = PluginBuilder::new("uidemo", "1.0.0")
+        let plugin = PluginBuilder::new("uidemo", "1.0.0")
             .ui(PluginUiContribution {
                 kind: UI_KIND_BUTTON.to_string(),
                 id: "count".into(),
@@ -1342,7 +2183,7 @@ mod tests {
 
     #[test]
     fn a_keybinding_is_declared_with_its_chord_and_dispatches() {
-        let mut plugin = PluginBuilder::new("uidemo", "1.0.0")
+        let plugin = PluginBuilder::new("uidemo", "1.0.0")
             .keybinding(
                 "focus",
                 "Focus mode",
@@ -1383,7 +2224,7 @@ mod tests {
 
     #[test]
     fn hooks_return_output_and_unknown_hooks_return_null() {
-        let mut plugin = plugin();
+        let plugin = plugin();
         let known = plugin
             .handle_request(json!({"jsonrpc": "2.0", "id": 7, "method": "hooks/run",
                                    "params": {"hook": "before_prompt", "payload": {}}}))
@@ -1399,7 +2240,7 @@ mod tests {
 
     #[test]
     fn tool_panel_and_hook_panics_are_rpc_errors_and_the_plugin_survives() {
-        let mut plugin = PluginBuilder::new("panic-demo", "1")
+        let plugin = PluginBuilder::new("panic-demo", "1")
             .tool("bad_tool", "Panics.", json!({}), |_req| {
                 std::panic::panic_any(42_u8)
             })
@@ -1465,8 +2306,56 @@ mod tests {
     }
 
     #[test]
+    fn a_slow_tool_call_does_not_block_a_second_request() {
+        // The contract `run()` is built on: the host multiplexes requests by id
+        // and expects replies in any order, so one slow handler must never
+        // serialize the rest. This is the regression behind "the panel 502s
+        // while a handoff runs" and "plugin not reading its stdin".
+        let latch = latch();
+        let plugin = std::sync::Arc::new(plugin_with_slow_tool(latch.clone()));
+        let (tx, rx) = std::sync::mpsc::channel::<Value>();
+
+        // The slow call, on its own thread against the SAME plugin.
+        let slow = std::sync::Arc::clone(&plugin);
+        let slow_done = tx.clone();
+        std::thread::spawn(move || {
+            let reply = slow.handle_request(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "slow", "arguments": {}}
+            }));
+            let _ = slow_done.send(reply.expect("the slow call must answer"));
+        });
+
+        // While it runs, two instant requests must answer at once: the tool
+        // list and a panel-less hooks/run both need the same tables.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let lister = std::sync::Arc::clone(&plugin);
+        let list_done = tx.clone();
+        std::thread::spawn(move || {
+            let reply = lister.handle_request(json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/list"
+            }));
+            let _ = list_done.send(reply.expect("tools/list must answer"));
+        });
+
+        // The instant reply must arrive while the slow call is still blocked.
+        let listed = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("tools/list must not queue behind the slow tool");
+        assert_eq!(listed["id"], json!(2), "got: {listed}");
+        assert_eq!(listed["result"]["tools"][0]["name"], json!("slow"));
+
+        // Release and collect the slow call.
+        open_latch(&latch);
+        let slow_reply = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the slow call must answer after release");
+        assert_eq!(slow_reply["id"], json!(1));
+    }
+
+    #[test]
     fn notifications_get_no_response_and_shutdown_stops_the_loop() {
-        let mut plugin = plugin();
+        let plugin = plugin();
         assert!(plugin
             .handle_request(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
             .is_none());
@@ -1535,7 +2424,7 @@ mod tests {
 
     #[test]
     fn panels_read_returns_the_handlers_data() {
-        let mut plugin = plugin_with_panel();
+        let plugin = plugin_with_panel();
         let response = plugin
             .handle_request(json!({
                 "jsonrpc": "2.0", "id": 20, "method": "panels/read",
@@ -1563,7 +2452,7 @@ mod tests {
 
     #[test]
     fn tools_call_reads_the_forwarded_context() {
-        let mut plugin = plugin_with_panel();
+        let plugin = plugin_with_panel();
         let with = plugin
             .handle_request(json!({
                 "jsonrpc": "2.0", "id": 22, "method": "tools/call",
@@ -1684,7 +2573,7 @@ mod tests {
 
     #[test]
     fn an_on_notify_handler_answers_the_hook_request() {
-        let mut plugin = PluginBuilder::new("bridge", "0.1.0")
+        let plugin = PluginBuilder::new("bridge", "0.1.0")
             .on_notify(|payload| json!({"title": payload["title"]}))
             .build();
         let response = plugin

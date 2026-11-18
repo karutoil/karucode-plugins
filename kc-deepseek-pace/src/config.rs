@@ -16,7 +16,8 @@
 //!   `KARUCODE_AUTH_TOKEN`, the plugin cannot read it from the environment - by
 //!   design - so it goes here, or the calls are refused with 401.
 
-use serde_json::Value;
+use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 
 /// Where the karucode server listens. The plugin is spawned by it and runs on the
 /// same machine, so loopback is right; a remote address would need TLS, which
@@ -187,13 +188,21 @@ impl Default for Config {
     }
 }
 
+fn json_u64(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_f64()
+            .filter(|f| f.is_finite() && *f >= 0.0 && *f <= u64::MAX as f64)
+            .map(|f| f.round() as u64)
+    })
+}
+
 impl Config {
     pub fn from_settings(settings: &Value) -> Self {
         let mut config = Config::default();
         let s = |k: &str| settings.get(k).and_then(Value::as_str);
         let b = |k: &str| settings.get(k).and_then(Value::as_bool);
-        let u = |k: &str| settings.get(k).and_then(Value::as_u64);
-        let ns = |k: &str| settings.get(k).and_then(Value::as_u64).map(|v| v as usize);
+        let u = |k: &str| settings.get(k).and_then(json_u64);
 
         if let Some(v) = b("enabled") {
             config.enabled = v;
@@ -209,26 +218,43 @@ impl Config {
             config.watch = v;
         }
         if let Some(v) = s("server") {
-            config.server = v.trim_end_matches('/').to_string();
+            let trimmed = v.trim().trim_end_matches('/');
+            if !trimmed.is_empty() {
+                config.server = trimmed.to_string();
+            }
         }
         if let Some(v) = s("token") {
             config.token = v.to_string();
         }
-        if let Some(list) = settings.get("models").and_then(Value::as_array) {
-            config.models = list
-                .iter()
-                .filter_map(Value::as_str)
-                .map(|m| m.trim().to_ascii_lowercase())
-                .filter(|m| !m.is_empty())
-                .collect();
+        if let Some(models) = settings.get("models") {
+            if let Some(list) = models.as_array() {
+                config.models = list
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|m| m.trim().to_ascii_lowercase())
+                    .filter(|m| !m.is_empty())
+                    .collect();
+            } else if let Some(text) = models.as_str() {
+                config.models = text
+                    .split(',')
+                    .map(|m| m.trim().to_ascii_lowercase())
+                    .filter(|m| !m.is_empty())
+                    .collect();
+            }
         }
         if let Some(v) = b("dry_run") {
             config.dry_run = v;
         }
 
         // A rung is written either as a bare number (seconds, characters left at
-        // the default) or as a table. `0` turns the rung off, which is the
-        // spelling an operator reaches for; `Rule::OFF` is what it means.
+        // the default), as a table, or via flat UI settings. `0` turns the rung
+        // off, which is the spelling an operator reaches for; `Rule::OFF` is what
+        // it means.
+        let defaults = Config::default();
+        let has_warn_obj = settings.get("warn").is_some();
+        let has_steer_obj = settings.get("steer").is_some();
+        let has_cancel_obj = settings.get("cancel").is_some();
+        let has_drift_obj = settings.get("drift").is_some();
         config.warn = rule(settings.get("warn"), config.warn);
         config.steer = rule(settings.get("steer"), config.steer);
         config.cancel = rule(settings.get("cancel"), config.cancel);
@@ -237,17 +263,17 @@ impl Config {
             config.drift = DriftRule {
                 after_turns: v
                     .get("after_turns")
-                    .and_then(Value::as_u64)
+                    .and_then(json_u64)
                     .map(|n| n as u32)
                     .unwrap_or(base.after_turns),
                 after_chars: v
                     .get("after_chars")
-                    .and_then(Value::as_u64)
+                    .and_then(json_u64)
                     .map(|n| n as usize)
                     .unwrap_or(base.after_chars),
                 chars_per_tool_call: v
                     .get("chars_per_tool_call")
-                    .and_then(Value::as_u64)
+                    .and_then(json_u64)
                     .map(|n| n as usize)
                     .unwrap_or(base.chars_per_tool_call),
             };
@@ -256,7 +282,53 @@ impl Config {
             }
         }
 
-        if let Some(v) = settings.get("narration_min").and_then(Value::as_u64) {
+        apply_flat_rule(
+            &mut config.warn,
+            defaults.warn,
+            u("warn_after_secs"),
+            u("warn_after_chars").map(|n| n as usize),
+            has_warn_obj,
+        );
+        apply_flat_rule(
+            &mut config.steer,
+            defaults.steer,
+            u("steer_after_secs"),
+            u("steer_after_chars").map(|n| n as usize),
+            has_steer_obj,
+        );
+        apply_flat_rule(
+            &mut config.cancel,
+            defaults.cancel,
+            u("cancel_after_secs"),
+            u("cancel_after_chars").map(|n| n as usize),
+            has_cancel_obj,
+        );
+        if !has_drift_obj || u("drift_after_turns").is_some_and(|v| v as u32 != defaults.drift.after_turns) {
+            if let Some(turns) = u("drift_after_turns") {
+                if turns == 0 {
+                    config.drift = DriftRule::OFF;
+                } else {
+                    if config.drift.is_off() {
+                        config.drift = defaults.drift;
+                    }
+                    config.drift.after_turns = turns as u32;
+                }
+            }
+        }
+        if !config.drift.is_off() {
+            if let Some(chars) = u("drift_after_chars") {
+                if !has_drift_obj || chars as usize != defaults.drift.after_chars {
+                    config.drift.after_chars = chars as usize;
+                }
+            }
+            if let Some(cpt) = u("drift_chars_per_tool_call") {
+                if !has_drift_obj || cpt as usize != defaults.drift.chars_per_tool_call {
+                    config.drift.chars_per_tool_call = (cpt as usize).max(100);
+                }
+            }
+        }
+
+        if let Some(v) = u("narration_min") {
             config.narration_min = (v as usize).max(1);
         }
         if let Some(v) = b("report_empty_run") {
@@ -271,8 +343,24 @@ impl Config {
         if let Some(v) = u("reconnect_secs") {
             config.reconnect_secs = v.clamp(1, 300);
         }
-        let _ = ns;
         config
+    }
+
+    pub fn merge_env_and_rpc(env: Value, rpc: BTreeMap<String, Value>) -> Value {
+        let mut map = match env {
+            Value::Object(obj) => obj,
+            _ => Map::new(),
+        };
+        for (k, v) in rpc {
+            if k == "models"
+                && v.as_str().is_some_and(|s| s.trim() == "deepseek")
+                && map.get("models").is_some_and(Value::is_array)
+            {
+                continue;
+            }
+            map.insert(k, v);
+        }
+        Value::Object(map)
     }
 
     /// Whether the interventions apply to this model id (the prompt is separate).
@@ -285,12 +373,40 @@ impl Config {
     }
 }
 
+fn apply_flat_rule(
+    target: &mut Rule,
+    default: Rule,
+    secs: Option<u64>,
+    chars: Option<usize>,
+    has_nested: bool,
+) {
+    if let Some(s) = secs {
+        if !has_nested || s != default.after_secs {
+            if s == 0 {
+                *target = Rule::OFF;
+                return;
+            }
+            if target.is_off() {
+                *target = default;
+            }
+            target.after_secs = s;
+        }
+    }
+    if !target.is_off() {
+        if let Some(c) = chars {
+            if !has_nested || c != default.after_chars {
+                target.after_chars = c;
+            }
+        }
+    }
+}
+
 fn rule(value: Option<&Value>, base: Rule) -> Rule {
     let Some(value) = value else { return base };
-    if value.as_bool() == Some(false) || value.as_u64() == Some(0) {
+    if value.as_bool() == Some(false) || json_u64(value) == Some(0) {
         return Rule::OFF;
     }
-    if let Some(secs) = value.as_u64() {
+    if let Some(secs) = json_u64(value) {
         return Rule {
             after_secs: secs,
             after_chars: base.after_chars,
@@ -298,11 +414,11 @@ fn rule(value: Option<&Value>, base: Rule) -> Rule {
     }
     let after_secs = value
         .get("after_secs")
-        .and_then(Value::as_u64)
+        .and_then(json_u64)
         .unwrap_or(base.after_secs);
     let after_chars = value
         .get("after_chars")
-        .and_then(Value::as_u64)
+        .and_then(json_u64)
         .map(|n| n as usize)
         .unwrap_or(base.after_chars);
     if after_secs == 0 && after_chars == 0 {
@@ -314,12 +430,19 @@ fn rule(value: Option<&Value>, base: Rule) -> Rule {
     }
 }
 
-/// The settings handed to the plugin by the host, read once per process.
+/// The settings handed to the plugin by the host (`plugin/settings/get` merged
+/// over `KARUCODE_PLUGIN_SETTINGS`).
 pub fn settings() -> Value {
-    std::env::var("KARUCODE_PLUGIN_SETTINGS")
+    let env = std::env::var("KARUCODE_PLUGIN_SETTINGS")
         .ok()
-        .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or(Value::Null)
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+    let rpc = if crate::sdk::HostClient::global().is_live() {
+        crate::sdk::settings()
+    } else {
+        BTreeMap::new()
+    };
+    Config::merge_env_and_rpc(env, rpc)
 }
 
 #[cfg(test)]

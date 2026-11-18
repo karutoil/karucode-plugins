@@ -110,23 +110,29 @@ struct PluginProcess {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    rpc_settings: Value,
 }
 
 impl PluginProcess {
     /// Hermetic default: a fixture karucode config, never the real install.
     fn start(settings: &Value) -> Self {
         let dir = fixture_data_dir();
-        Self::spawn(settings, Some(dir))
+        Self::spawn(settings, Some(dir), json!({}))
+    }
+
+    fn start_with_rpc(settings: &Value, rpc_settings: Value) -> Self {
+        let dir = fixture_data_dir();
+        Self::spawn(settings, Some(dir), rpc_settings)
     }
 
     /// For the live test: keep whatever `KARUCODE_DATA_DIR` / `KARUCODE_CONFIG`
     /// the harness set, so model resolution runs exactly as the hosted plugin
     /// would (the default `spawn` pins a fixture instead).
     fn start_keeping_host_env(settings: &Value) -> Self {
-        Self::spawn(settings, None)
+        Self::spawn(settings, None, json!({}))
     }
 
-    fn spawn(settings: &Value, data_dir: Option<std::path::PathBuf>) -> Self {
+    fn spawn(settings: &Value, data_dir: Option<std::path::PathBuf>, rpc_settings: Value) -> Self {
         let mut command = Command::new(BIN);
         if let Some(dir) = &data_dir {
             command.env("KARUCODE_DATA_DIR", dir);
@@ -144,6 +150,7 @@ impl PluginProcess {
             child,
             stdin,
             stdout: BufReader::new(stdout),
+            rpc_settings,
         }
     }
 
@@ -157,12 +164,24 @@ impl PluginProcess {
     }
 
     fn recv(&mut self, id: i64) -> Value {
-        let mut line = String::new();
-        self.stdout.read_line(&mut line).expect("read plugin line");
-        assert!(!line.is_empty(), "plugin closed stdout");
-        let value: Value = serde_json::from_str(line.trim()).expect("parse plugin response");
-        assert_eq!(value["id"], json!(id), "response id mismatch: {value}");
-        value
+        loop {
+            let mut line = String::new();
+            self.stdout.read_line(&mut line).expect("read plugin line");
+            assert!(!line.is_empty(), "plugin closed stdout");
+            let value: Value = serde_json::from_str(line.trim()).expect("parse plugin response");
+            if value.get("method").and_then(Value::as_str) == Some("plugin/settings/get") {
+                if let Some(req_id) = value.get("id") {
+                    let reply = json!({"jsonrpc": "2.0", "id": req_id, "result": {"settings": self.rpc_settings}});
+                    self.stdin
+                        .write_all(format!("{reply}\n").as_bytes())
+                        .unwrap();
+                    self.stdin.flush().unwrap();
+                }
+                continue;
+            }
+            assert_eq!(value["id"], json!(id), "response id mismatch: {value}");
+            return value;
+        }
     }
 
     fn initialize(&mut self) -> Value {
@@ -868,4 +887,23 @@ fn draw_text_png(text: &str) -> String {
         "need Pillow or ImageMagick to draw the live-test image"
     );
     path_str
+}
+
+#[test]
+fn plugin_settings_get_overrides_env_settings() {
+    let mut plugin = PluginProcess::start_with_rpc(
+        &json!({"run_timeout_secs": 30, "max_output_chars": 5000}),
+        json!({"run_timeout_secs": 42.0, "max_output_chars": 9000, "model": "od/vision-b"}),
+    );
+    plugin.initialize();
+    let response = plugin.call(
+        2,
+        json!({"method": "tools/call", "params": {"name": "status", "arguments": {}}}),
+    );
+    let (ok, text) = tool_result(&response);
+    assert!(ok, "{text}");
+    let parsed: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(parsed["run_timeout_secs"], 42);
+    assert_eq!(parsed["max_output_chars"], 9000);
+    assert_eq!(parsed["requested_model"], "od/vision-b");
 }

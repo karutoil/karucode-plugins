@@ -55,7 +55,8 @@
 //! | `workspace` | none | pin the workspace when the host does not send call context |
 //! | `session` | none | pin the session when the host does not send call context |
 
-use serde_json::Value;
+use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -66,7 +67,17 @@ pub const DEFAULT_SESSIONS_DIR: &str = ".karucode/todo/sessions";
 
 static SETTINGS: OnceLock<Value> = OnceLock::new();
 
-/// The parsed `KARUCODE_PLUGIN_SETTINGS` object, read once per process.
+fn json_u64(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_f64()
+            .filter(|f| f.is_finite() && *f >= 0.0 && *f <= u64::MAX as f64)
+            .map(|f| f.round() as u64)
+    })
+}
+
+/// The effective settings (`plugin/settings/get` merged over
+/// `KARUCODE_PLUGIN_SETTINGS`), read once per process.
 ///
 /// Parsed leniently on purpose: a malformed settings table must not stop the
 /// plugin from loading, because every setting has a working default. The first
@@ -74,11 +85,27 @@ static SETTINGS: OnceLock<Value> = OnceLock::new();
 /// log) and simply falls back.
 pub fn settings() -> &'static Value {
     SETTINGS.get_or_init(|| {
-        std::env::var("KARUCODE_PLUGIN_SETTINGS")
+        let env = std::env::var("KARUCODE_PLUGIN_SETTINGS")
             .ok()
             .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
             .filter(Value::is_object)
-            .unwrap_or(Value::Null)
+            .unwrap_or(Value::Null);
+        let rpc = if crate::sdk::HostClient::global().is_live() {
+            crate::sdk::settings()
+        } else {
+            BTreeMap::new()
+        };
+        if rpc.is_empty() {
+            return env;
+        }
+        let mut map = match env {
+            Value::Object(obj) => obj,
+            _ => Map::new(),
+        };
+        for (k, v) in rpc {
+            map.insert(k, v);
+        }
+        Value::Object(map)
     })
 }
 
@@ -89,7 +116,7 @@ fn setting<'a>(key: &str) -> Option<&'a Value> {
 /// Concurrent `in_progress` ceiling, minimum 1.
 pub fn max_in_progress() -> usize {
     setting("max_in_progress")
-        .and_then(Value::as_u64)
+        .and_then(json_u64)
         .map(|n| n.max(1) as usize)
         .unwrap_or(1)
 }
@@ -106,7 +133,7 @@ pub fn carry_over_reminder() -> bool {
 /// prefix: keeping it bounded keeps the cache warm.
 pub fn compact_from() -> usize {
     setting("compact_from")
-        .and_then(Value::as_u64)
+        .and_then(json_u64)
         .map(|n| n.max(4) as usize)
         .unwrap_or(24)
 }

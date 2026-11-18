@@ -29,20 +29,45 @@ mod session_vision;
 
 use config::Settings;
 use media::Image;
-use sdk::{hooks, PluginBuilder, PluginToolResult, PluginToolResultExt, ToolRequest};
+use sdk::{
+    hooks, HostClient, PluginBuilder, PluginSetting, PluginSettingKind, PluginToolResult,
+    PluginToolResultExt, ToolRequest,
+};
 use serde_json::{json, Value};
-use std::io::{BufRead, Write};
+use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
 fn settings() -> &'static Settings {
     static SETTINGS: OnceLock<Settings> = OnceLock::new();
     SETTINGS.get_or_init(|| {
-        let (settings, problem) =
-            Settings::parse(std::env::var("KARUCODE_PLUGIN_SETTINGS").ok().as_deref());
-        if let Some(problem) = problem {
-            eprintln!("[image-handoff] {problem}");
+        let raw = std::env::var("KARUCODE_PLUGIN_SETTINGS").ok();
+        let env = raw
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .and_then(|r| match serde_json::from_str::<Value>(r) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    eprintln!(
+                        "[image-handoff] plugin settings are not valid JSON ({e}); using defaults"
+                    );
+                    None
+                }
+            })
+            .unwrap_or(Value::Null);
+        let rpc = if HostClient::global().is_live() {
+            sdk::settings()
+        } else {
+            BTreeMap::new()
+        };
+        let merged = Settings::merge_env_and_rpc(env, rpc);
+        match serde_json::from_value::<Settings>(merged) {
+            Ok(s) => s.normalized(),
+            Err(e) => {
+                eprintln!("[image-handoff] plugin settings are invalid ({e}); using defaults");
+                Settings::default()
+            }
         }
-        settings
     })
 }
 
@@ -399,11 +424,102 @@ fn before_prompt(payload: Value) -> Value {
     )
 }
 
+fn declared_settings() -> Vec<PluginSetting> {
+    let defaults = Settings::default();
+    vec![
+        PluginSetting {
+            key: "server".into(),
+            label: "karucode server URL".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(defaults.server),
+            help: "Loopback HTTP URL of the karucode server that spawned this plugin.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "api_token".into(),
+            label: "Server bearer token".into(),
+            kind: PluginSettingKind::Secret,
+            default: json!(""),
+            help: "Bearer token when the karucode server runs with KARUCODE_AUTH_TOKEN.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "api_token_env".into(),
+            label: "Token environment variable name".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(""),
+            help: "Optional env var holding the token (empty = IMAGE_HANDOFF_TOKEN).".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "model".into(),
+            label: "Vision model override".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(""),
+            help: "Optional karucode model id to pin for image reads (empty = auto-select).".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "provider".into(),
+            label: "Vision provider override".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(""),
+            help: "Optional provider profile id paired with `model` (empty = auto-select).".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "run_timeout_secs".into(),
+            label: "Vision handoff timeout (seconds)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.run_timeout_secs),
+            help: "End-to-end deadline for one vision handoff (keep under 55s for 60s tool cap)."
+                .into(),
+            min: Some(1.0),
+            max: Some(600.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "max_image_mb".into(),
+            label: "Max image size (MiB)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.max_image_mb),
+            help: "Maximum accepted image file size in MiB (1..8 MiB upload ceiling).".into(),
+            min: Some(1.0),
+            max: Some(8.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "max_output_chars".into(),
+            label: "Max vision answer length (chars)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(defaults.max_output_chars),
+            help: "Maximum characters returned from the vision model response.".into(),
+            min: Some(1000.0),
+            max: Some(20_000.0),
+            options: Vec::new(),
+        },
+    ]
+}
+
 fn build_plugin() -> sdk::Plugin {
-    PluginBuilder::new("image-handoff", env!("CARGO_PKG_VERSION"))
+    let mut builder = PluginBuilder::new("image-handoff", env!("CARGO_PKG_VERSION"))
         .description("Hand images to one of karucode's vision models through a temporary session")
         .permission(sdk::permissions::FILES_READ)
-        .permission(sdk::permissions::NETWORK)
+        .permission(sdk::permissions::NETWORK);
+    for setting in declared_settings() {
+        builder = builder.setting(setting);
+    }
+    builder
         .tool_with_class(
             "see",
             "Read an image (a PNG, JPEG, GIF, WebP or BMP) with a vision model and return \
@@ -491,144 +607,8 @@ fn panel(_req: sdk::PanelRequest) -> Value {
     json!({"view": "stack", "views": views})
 }
 
-/// How many requests may run at once. A plugin is one small local process; the
-/// host multiplexes requests by JSON-RPC id and caps its own concurrency, so a
-/// small pool is plenty and a flood cannot spawn unbounded threads.
-const WORKERS: usize = 8;
-
-/// Serve the plugin concurrently.
-///
-/// The vendored SDK's `run()` loop answers one request at a time, and `see`
-/// can hold it for a whole vision handoff (~55s): every panel read, hook and
-/// `status` call queues behind it until the host's per-request budget expires,
-/// which is exactly the "HTTP 502" the panel route reports while a handoff
-/// runs (and, worse, a plugin that has stopped answering reads as "not
-/// reading its stdin" on the host side and gets killed). The host multiplexes
-/// requests by JSON-RPC id, so replies are allowed in any order.
-///
-/// So `main` runs its own loop: N workers, each with its own `sdk::Plugin`
-/// (handlers are stateless closures over this crate's thread-safe statics), a
-/// shared job queue, and one writer thread that owns stdout. Workers hand
-/// replies **directly** to the writer - the reply must not wait for the reader
-/// to see another stdin line first, because the host sends one request and
-/// waits for its answer before sending anything else.
-///
-/// Exit: `shutdown` sets a flag and the loop stops reading; the job channel
-/// closes, each worker finishes what it holds and then returns (so a request
-/// that raced the shutdown still gets its reply), and the writer drains the
-/// reply channel to the end before the process exits.
-fn serve() -> std::io::Result<()> {
-    let stdin = std::io::stdin();
-    let mut reader = stdin.lock();
-    let mut line = String::new();
-
-    // The reply channel every worker sends to and the one writer reads from.
-    let (line_tx, line_rx) = std::sync::mpsc::channel::<String>();
-    let writer = std::thread::Builder::new()
-        .name("image-handoff-writer".into())
-        .spawn(move || {
-            let mut stdout = std::io::stdout();
-            let mut ok = true;
-            while let Ok(line) = line_rx.recv() {
-                if writeln!(stdout, "{line}")
-                    .and_then(|_| stdout.flush())
-                    .is_err()
-                {
-                    ok = false;
-                    break;
-                }
-            }
-            ok
-        })
-        .expect("spawn the stdout writer");
-
-    let (job_tx, job_rx) = std::sync::mpsc::channel::<Value>();
-    let job_rx = std::sync::Arc::new(std::sync::Mutex::new(job_rx));
-    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    for _ in 0..WORKERS {
-        let jobs = std::sync::Arc::clone(&job_rx);
-        let flag = std::sync::Arc::clone(&shutdown);
-        let lines = line_tx.clone();
-        std::thread::Builder::new()
-            .name("image-handoff-worker".into())
-            .spawn(move || {
-                // Its own Plugin: the handlers only touch this crate's
-                // thread-safe statics, so instances are independent.
-                let mut plugin = build_plugin();
-                loop {
-                    let request = match jobs.lock().unwrap_or_else(|p| p.into_inner()).recv() {
-                        Ok(request) => request,
-                        Err(_) => return, // The job channel closed: drained.
-                    };
-                    // Read the drain signal before the request is moved.
-                    let is_shutdown =
-                        request.get("method").and_then(Value::as_str) == Some("shutdown");
-                    if let Some(response) = plugin.handle_request(request) {
-                        if is_shutdown && response.get("result").is_some_and(Value::is_null) {
-                            flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                        }
-                        // Straight to the writer: never queue behind the reader.
-                        if lines.send(response.to_string()).is_err() {
-                            return; // The writer is gone: nothing to answer to.
-                        }
-                    }
-                }
-            })
-            .expect("spawn a worker");
-    }
-    // Only the workers hold reply senders now (plus this one for parse errors).
-    let error_line_tx = line_tx.clone();
-    drop(line_tx);
-
-    loop {
-        line.clear();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let request: Value = match serde_json::from_str(trimmed) {
-            Ok(value) => value,
-            Err(e) => {
-                // A malformed line is not recoverable per-request (its id is
-                // unknown), so report with id null and keep going.
-                let error = json!({
-                    "jsonrpc": "2.0",
-                    "id": null,
-                    "error": {"code": -32700, "message": format!("parse error: {e}")},
-                });
-                error_line_tx.send(error.to_string()).map_err(send_err)?;
-                continue;
-            }
-        };
-        job_tx.send(request).map_err(send_err)?;
-        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
-        }
-    }
-    // EOF or shutdown: close the job queue so the workers finish what they
-    // hold and return, then let the writer drain every reply that follows.
-    drop(job_tx);
-    drop(error_line_tx);
-    let wrote_everything = writer.join().unwrap_or(false);
-    if !wrote_everything {
-        return Err(std::io::Error::other(
-            "stdout closed while writing a plugin reply",
-        ));
-    }
-    Ok(())
-}
-
-/// A send failure means the writer or a worker died: a broken plugin.
-fn send_err<T>(_e: std::sync::mpsc::SendError<T>) -> std::io::Error {
-    std::io::Error::other("a plugin channel closed before its reply arrived")
-}
-
 fn main() -> std::io::Result<()> {
-    let _ = settings();
-    serve()
+    build_plugin().run()
 }
 
 #[cfg(test)]
@@ -655,7 +635,7 @@ mod tests {
 
     #[test]
     fn tool_surface_is_stable_and_bounded() {
-        let mut plugin = build_plugin();
+        let plugin = build_plugin();
         assert_eq!(plugin.manifest().name, "image-handoff");
         assert_eq!(plugin.manifest().protocol, "1");
         let listed = plugin
@@ -683,5 +663,13 @@ mod tests {
         let out = truncate_chars(&"x".repeat(50), 10);
         assert!(out.contains("[… truncated]"));
         assert_eq!(out.chars().count(), 10 + "\n[… truncated]".chars().count());
+    }
+
+    #[test]
+    fn declared_settings_pass_host_validation() {
+        let plugin = build_plugin();
+        let settings = &plugin.manifest().settings;
+        assert_eq!(settings.len(), 8);
+        sdk::validate_settings(settings).expect("declared settings must be valid");
     }
 }

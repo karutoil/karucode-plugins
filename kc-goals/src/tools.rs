@@ -165,31 +165,26 @@ fn criteria_from(value: &Value, verify_commands: bool) -> Result<Vec<Criterion>,
     Ok(out)
 }
 
-pub fn register(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
-    let builder = register_set(builder, Arc::clone(&app));
-    let builder = register_status(builder, Arc::clone(&app));
-    let builder = register_criterion(builder, Arc::clone(&app));
-    let builder = register_progress(builder, Arc::clone(&app));
-    let builder = register_complete(builder, Arc::clone(&app));
-    let builder = register_pause(builder, Arc::clone(&app));
-    let builder = register_resume(builder, Arc::clone(&app));
-    let builder = register_abandon(builder, Arc::clone(&app));
-    let builder = register_options(builder, Arc::clone(&app));
-    // `goal_check` runs commands, so it is not registered at all unless the
-    // operator turned verification on. Two reasons: a tool that cannot work is
-    // noise in the model's tool list, and a plugin should not be able to talk its
-    // way into a shell it was not granted (the host's own class/permission gate is
-    // a newer build than the one this was tested against, so this does not rely on
-    // it). A reload after changing `verify_commands` adds or removes the tool.
-    let builder = if app.cfg.verify_commands {
-        register_check(builder, Arc::clone(&app))
-    } else {
-        builder
-    };
+pub type AppRef = fn() -> &'static Arc<App>;
+
+pub fn register(builder: PluginBuilder, app: AppRef) -> PluginBuilder {
+    let builder = register_set(builder, app);
+    let builder = register_status(builder, app);
+    let builder = register_criterion(builder, app);
+    let builder = register_progress(builder, app);
+    let builder = register_complete(builder, app);
+    let builder = register_pause(builder, app);
+    let builder = register_resume(builder, app);
+    let builder = register_abandon(builder, app);
+    let builder = register_options(builder, app);
+    // `goal_check` declares the `shell` class, so the host withholds it unless
+    // the registration grants `shell`; at runtime it also checks
+    // `app().cfg.verify_commands` so toggling the UI setting works cleanly.
+    let builder = register_check(builder, app);
     register_list(builder, app)
 }
 
-fn register_set(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
+fn register_set(builder: PluginBuilder, app: AppRef) -> PluginBuilder {
     builder.tool(
         "goal_set",
         &desc(
@@ -224,7 +219,7 @@ fn register_set(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
             },
             "required": ["title", "criteria"]
         }),
-        move |req| set(&app, req),
+        move |req| set(app(), req),
     )
 }
 
@@ -308,7 +303,7 @@ fn set(app: &App, req: ToolRequest) -> PluginToolResult {
     }
 }
 
-fn register_status(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
+fn register_status(builder: PluginBuilder, app: AppRef) -> PluginBuilder {
     builder.tool(
         "goal_status",
         &desc(
@@ -322,7 +317,7 @@ fn register_status(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
                 "goal": {"type": "string", "description": "Goal id (default: the open one)."}
             }
         }),
-        move |req| status(&app, req),
+        move |req| status(app(), req),
     )
 }
 
@@ -348,7 +343,7 @@ fn status(app: &App, req: ToolRequest) -> PluginToolResult {
     }
 }
 
-fn register_criterion(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
+fn register_criterion(builder: PluginBuilder, app: AppRef) -> PluginBuilder {
     builder.tool(
         "goal_criterion",
         &desc(
@@ -368,7 +363,7 @@ fn register_criterion(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
             },
             "required": ["criterion"]
         }),
-        move |req| criterion(&app, req),
+        move |req| criterion(app(), req),
     )
 }
 
@@ -409,7 +404,7 @@ fn criterion(app: &App, req: ToolRequest) -> PluginToolResult {
     }
 }
 
-fn register_progress(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
+fn register_progress(builder: PluginBuilder, app: AppRef) -> PluginBuilder {
     builder.tool(
         "goal_progress",
         &desc(
@@ -427,7 +422,7 @@ fn register_progress(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
             },
             "required": ["note"]
         }),
-        move |req| progress(&app, req),
+        move |req| progress(app(), req),
     )
 }
 
@@ -469,7 +464,7 @@ fn progress(app: &App, req: ToolRequest) -> PluginToolResult {
     }
 }
 
-fn register_complete(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
+fn register_complete(builder: PluginBuilder, app: AppRef) -> PluginBuilder {
     builder.tool(
         "goal_complete",
         &desc(
@@ -484,7 +479,7 @@ fn register_complete(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
                 "goal": {"type": "string", "description": "Goal id (default: the open one)."}
             }
         }),
-        move |req| complete(&app, req),
+        move |req| complete(app(), req),
     )
 }
 
@@ -531,7 +526,7 @@ fn complete(app: &App, req: ToolRequest) -> PluginToolResult {
     }
 }
 
-fn register_pause(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
+fn register_pause(builder: PluginBuilder, app: AppRef) -> PluginBuilder {
     builder.tool(
         "goal_pause",
         &desc(
@@ -547,7 +542,7 @@ fn register_pause(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
             },
             "required": ["reason"]
         }),
-        move |req| pause(&app, req),
+        move |req| pause(app(), req),
     )
 }
 
@@ -591,7 +586,7 @@ fn pause(app: &App, req: ToolRequest) -> PluginToolResult {
     }
 }
 
-fn register_resume(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
+fn register_resume(builder: PluginBuilder, app: AppRef) -> PluginBuilder {
     builder.tool(
         "goal_resume",
         &desc(
@@ -605,7 +600,7 @@ fn register_resume(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
                 "goal": {"type": "string", "description": "Goal id (default: the open one, else the newest)."}
             }
         }),
-        move |req| resume(&app, req),
+        move |req| resume(app(), req),
     )
 }
 
@@ -635,7 +630,7 @@ fn resume(app: &App, req: ToolRequest) -> PluginToolResult {
     }
 }
 
-fn register_abandon(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
+fn register_abandon(builder: PluginBuilder, app: AppRef) -> PluginBuilder {
     builder.tool(
         "goal_abandon",
         &desc(
@@ -650,7 +645,7 @@ fn register_abandon(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
             },
             "required": ["reason"]
         }),
-        move |req| abandon(&app, req),
+        move |req| abandon(app(), req),
     )
 }
 
@@ -690,7 +685,7 @@ fn abandon(app: &App, req: ToolRequest) -> PluginToolResult {
     }
 }
 
-fn register_options(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
+fn register_options(builder: PluginBuilder, app: AppRef) -> PluginBuilder {
     builder.tool(
         "goal_options",
         &desc(
@@ -709,7 +704,7 @@ fn register_options(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
                 "max_failed_retries": {"type": "integer", "description": "Retries after a failed run. 0 = retry forever (default)."}
             }
         }),
-        move |req| options(&app, req),
+        move |req| options(app(), req),
     )
 }
 
@@ -793,7 +788,7 @@ fn options(app: &App, req: ToolRequest) -> PluginToolResult {
     }
 }
 
-fn register_check(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
+fn register_check(builder: PluginBuilder, app: AppRef) -> PluginBuilder {
     // Declared with the `shell` class on purpose: the host withholds the tool
     // unless the registration grants `shell`, which makes the permission the
     // switch that turns verification on rather than a line of documentation.
@@ -813,7 +808,7 @@ fn register_check(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
             }
         }),
         Some("shell"),
-        move |req| check(&app, req),
+        move |req| check(app(), req),
     )
 }
 
@@ -920,7 +915,7 @@ fn check(app: &App, req: ToolRequest) -> PluginToolResult {
     }
 }
 
-fn register_list(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
+fn register_list(builder: PluginBuilder, app: AppRef) -> PluginBuilder {
     builder.tool(
         "goal_list",
         &desc(
@@ -929,7 +924,7 @@ fn register_list(builder: PluginBuilder, app: Arc<App>) -> PluginBuilder {
              cannot see.",
         ),
         json!({"type": "object", "properties": {}}),
-        move |req| list(&app, req),
+        move |req| list(app(), req),
     )
 }
 

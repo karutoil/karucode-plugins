@@ -5,23 +5,56 @@
 
 #[allow(dead_code)]
 mod protocol;
-#[allow(dead_code)]
+#[allow(dead_code, unused_imports)]
 mod sdk;
 
 use crate::sdk::{
-    hooks, permissions, PluginBuilder, PluginToolResult, PluginToolResultExt, ToolRequest,
+    hooks, permissions, HostClient, Plugin, PluginBuilder, PluginSetting, PluginSettingKind,
+    PluginToolResult, PluginToolResultExt, ToolRequest,
 };
-use kc_lightpanda::browser::{BrowserConfig, BrowserManager};
-use serde_json::{json, Value};
+use kc_lightpanda::browser::{
+    BrowserConfig, BrowserManager, DEFAULT_VIEWPORT_HEIGHT, DEFAULT_VIEWPORT_WIDTH, MAX_VIEWPORT,
+    MIN_VIEWPORT,
+};
+use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
+static MANAGER: OnceLock<Mutex<BrowserManager>> = OnceLock::new();
+
+fn merge_settings(env: Value, rpc: BTreeMap<String, Value>) -> Value {
+    let mut map = match env {
+        Value::Object(obj) => obj,
+        _ => Map::new(),
+    };
+    for (k, v) in rpc {
+        if k == "extra_args"
+            && v.as_str().is_some_and(|s| s.trim().is_empty())
+            && map.get("extra_args").is_some_and(Value::is_array)
+        {
+            continue;
+        }
+        map.insert(k, v);
+    }
+    Value::Object(map)
+}
+
+fn load_effective_settings() -> Value {
+    let env = std::env::var("KARUCODE_PLUGIN_SETTINGS")
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+    let rpc = if HostClient::global().is_live() {
+        sdk::settings()
+    } else {
+        BTreeMap::new()
+    };
+    merge_settings(env, rpc)
+}
+
 fn manager() -> &'static Mutex<BrowserManager> {
-    static MANAGER: OnceLock<Mutex<BrowserManager>> = OnceLock::new();
     MANAGER.get_or_init(|| {
-        let settings = std::env::var("KARUCODE_PLUGIN_SETTINGS")
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-            .unwrap_or(Value::Null);
+        let settings = load_effective_settings();
         Mutex::new(BrowserManager::new(BrowserConfig::from_settings(&settings)))
     })
 }
@@ -41,15 +74,134 @@ fn page_arg(req: &ToolRequest) -> Option<i64> {
     req.arguments.get("pageId").and_then(|v| v.as_i64())
 }
 
-fn main() -> std::io::Result<()> {
-    let run_result = PluginBuilder::new("lightpanda", "0.1.0")
+fn declared_settings() -> Vec<PluginSetting> {
+    vec![
+        PluginSetting {
+            key: "browser_path".into(),
+            label: "Lightpanda binary path".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(""),
+            help: "Optional path to the lightpanda executable (empty = auto-detect on PATH).".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "web_socket_url".into(),
+            label: "External Lightpanda CDP WebSocket URL".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(""),
+            help: "Attach to an existing ws://host:port/ CDP server instead of spawning lightpanda serve.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "viewport_width".into(),
+            label: "Default viewport width (px)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(DEFAULT_VIEWPORT_WIDTH),
+            help: "Initial viewport width in CSS pixels.".into(),
+            min: Some(MIN_VIEWPORT as f64),
+            max: Some(MAX_VIEWPORT as f64),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "viewport_height".into(),
+            label: "Default viewport height (px)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(DEFAULT_VIEWPORT_HEIGHT),
+            help: "Initial viewport height in CSS pixels.".into(),
+            min: Some(MIN_VIEWPORT as f64),
+            max: Some(MAX_VIEWPORT as f64),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "protocol_timeout_secs".into(),
+            label: "CDP command timeout (seconds)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(30),
+            help: "How long a single CDP command may wait before failing.".into(),
+            min: Some(1.0),
+            max: Some(600.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "startup_timeout_secs".into(),
+            label: "Lightpanda startup timeout (seconds)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(30),
+            help: "How long to wait for lightpanda serve to bind its CDP port.".into(),
+            min: Some(1.0),
+            max: Some(600.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "screenshot_dir".into(),
+            label: "Screenshot output directory".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(""),
+            help: "Optional directory for saved PNG screenshots (empty = temp dir).".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "max_snapshot_nodes".into(),
+            label: "Max accessibility snapshot nodes".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(2500),
+            help: "Default cap on rendered accessibility tree nodes in take_snapshot.".into(),
+            min: Some(1.0),
+            max: Some(100_000.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "extra_args".into(),
+            label: "Extra Lightpanda CLI flags".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(""),
+            help: "Space-separated extra flags passed to `lightpanda serve`.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "obey_robots".into(),
+            label: "Obey robots.txt".into(),
+            kind: PluginSettingKind::Bool,
+            default: json!(false),
+            help: "Respect robots.txt directives when Lightpanda fetches pages.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "telemetry".into(),
+            label: "Enable Lightpanda usage telemetry".into(),
+            kind: PluginSettingKind::Bool,
+            default: json!(false),
+            help: "Allow Lightpanda to send usage telemetry (disabled by default).".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+    ]
+}
+
+fn build_plugin() -> Plugin {
+    let mut builder = PluginBuilder::new("lightpanda", "0.1.0")
         .description(
             "Drive Lightpanda over CDP: list and open pages, navigate, inspect the \
              accessibility tree, click/fill/hover by element uid, evaluate JavaScript, \
              capture console output and save text-rendered PNG screenshots.",
         )
         .permission(permissions::SHELL)
-        .permission(permissions::NETWORK)
+        .permission(permissions::NETWORK);
+    for setting in declared_settings() {
+        builder = builder.setting(setting);
+    }
+    builder
         .tool_with_class(
             "list_pages",
             "List pages opened by this plugin, with their pageId, URL and title. Call this \
@@ -445,14 +597,45 @@ fn main() -> std::io::Result<()> {
                  page rendering; it is not a pixel-identical graphical browser."
             ))
         })
-        .run();
+        .build()
+}
+
+fn main() -> std::io::Result<()> {
+    let run_result = build_plugin().run();
 
     // The process-lifetime OnceLock intentionally outlives ordinary Rust stack
     // drop order. Explicitly release pages and the owned browser on stdin EOF or
     // the SDK's shutdown notification, including non-Linux graceful shutdown.
-    match manager().lock() {
-        Ok(mut manager) => manager.shutdown(),
-        Err(_) => eprintln!("kc-lightpanda: could not lock the manager during shutdown"),
+    if let Some(lock) = MANAGER.get() {
+        match lock.lock() {
+            Ok(mut manager) => manager.shutdown(),
+            Err(_) => eprintln!("kc-lightpanda: could not lock the manager during shutdown"),
+        }
     }
     run_result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn declared_settings_pass_host_validation() {
+        let plugin = build_plugin();
+        let settings = &plugin.manifest().settings;
+        assert_eq!(settings.len(), 11);
+        sdk::validate_settings(settings).expect("declared settings must be valid");
+    }
+
+    #[test]
+    fn merge_settings_preserves_env_array_extra_args() {
+        let env = json!({"extra_args": ["--foo"]});
+        let mut rpc = BTreeMap::new();
+        rpc.insert("extra_args".into(), json!(""));
+        rpc.insert("obey_robots".into(), json!(true));
+        let merged = merge_settings(env, rpc);
+        let cfg = BrowserConfig::from_settings(&merged);
+        assert!(cfg.obey_robots);
+        assert_eq!(cfg.extra_args, vec!["--foo".to_string()]);
+    }
 }

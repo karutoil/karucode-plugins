@@ -3,8 +3,9 @@
 //! provider configuration - so the settings are the server address, a token,
 //! and bounds. No endpoint, model id or API key of its own.
 
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Map, Value};
+use std::collections::BTreeMap;
 
 /// The loopback server kc-goals and this plugin speak to.
 pub const DEFAULT_SERVER: &str = "http://127.0.0.1:8787";
@@ -38,14 +39,53 @@ pub struct Settings {
     #[serde(default)]
     pub provider: Option<String>,
     /// Wall-clock bound for one whole handoff (session → run → answer).
-    #[serde(default = "default_run_timeout")]
+    #[serde(default = "default_run_timeout", deserialize_with = "de_lenient_u64")]
     pub run_timeout_secs: u64,
     /// Largest image accepted, in MiB (the upload ceiling is 8 MiB).
-    #[serde(default = "default_max_image_mb")]
+    #[serde(
+        default = "default_max_image_mb",
+        deserialize_with = "de_lenient_usize"
+    )]
     pub max_image_mb: usize,
     /// Largest answer returned to the calling model, in characters.
-    #[serde(default = "default_max_output_chars")]
+    #[serde(
+        default = "default_max_output_chars",
+        deserialize_with = "de_lenient_usize"
+    )]
     pub max_output_chars: usize,
+}
+
+fn de_lenient_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    value
+        .as_u64()
+        .or_else(|| {
+            value
+                .as_f64()
+                .filter(|f| f.is_finite() && *f >= 0.0 && *f <= u64::MAX as f64)
+                .map(|f| f.round() as u64)
+        })
+        .ok_or_else(|| serde::de::Error::custom("expected a non-negative number"))
+}
+
+fn de_lenient_usize<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    value
+        .as_u64()
+        .or_else(|| {
+            value
+                .as_f64()
+                .filter(|f| f.is_finite() && *f >= 0.0 && *f <= usize::MAX as f64)
+                .map(|f| f.round() as u64)
+        })
+        .map(|n| n as usize)
+        .ok_or_else(|| serde::de::Error::custom("expected a non-negative integer"))
 }
 
 fn default_server() -> String {
@@ -77,6 +117,7 @@ impl Default for Settings {
 }
 
 impl Settings {
+    #[cfg(test)]
     pub fn parse(raw: Option<&str>) -> (Self, Option<String>) {
         let Some(raw) = raw.map(str::trim).filter(|r| !r.is_empty()) else {
             return (Self::default(), None);
@@ -100,18 +141,52 @@ impl Settings {
     }
 
     pub fn normalized(mut self) -> Self {
-        self.server = self.server.trim().trim_end_matches('/').to_string();
+        let server = self.server.trim().trim_end_matches('/').to_string();
+        self.server = if server.is_empty() {
+            default_server()
+        } else {
+            server
+        };
         self.run_timeout_secs = self.run_timeout_secs.clamp(1, 600);
         // The upload route's hard ceiling; do not configure past it.
         self.max_image_mb = self.max_image_mb.clamp(1, 8);
         self.max_output_chars = self.max_output_chars.clamp(1_000, 20_000);
-        if let Some(model) = self.model.as_deref() {
-            self.model = Some(model.trim().to_string()).filter(|m| !m.is_empty());
-        }
-        if let Some(provider) = self.provider.as_deref() {
-            self.provider = Some(provider.trim().to_string()).filter(|p| !p.is_empty());
-        }
+        self.api_token = self
+            .api_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string);
+        self.api_token_env = self
+            .api_token_env
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+        self.model = self
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string);
+        self.provider = self
+            .provider
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string);
         self
+    }
+
+    pub fn merge_env_and_rpc(env: Value, rpc: BTreeMap<String, Value>) -> Value {
+        let mut map = match env {
+            Value::Object(obj) => obj,
+            _ => Map::new(),
+        };
+        for (k, v) in rpc {
+            map.insert(k, v);
+        }
+        Value::Object(map)
     }
 
     /// The token: the explicit setting, then the named environment variable.

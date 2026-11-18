@@ -74,21 +74,32 @@ impl PluginProcess {
         let stdin = self.stdin.as_mut().expect("plugin stdin is open");
         writeln!(stdin, "{message}").expect("write plugin request");
         stdin.flush().expect("flush plugin request");
-        let line = self
-            .lines
-            .recv_timeout(Duration::from_secs(40))
-            .unwrap_or_else(|err| panic!("plugin did not answer {method}: {err}"))
-            .expect("read plugin response");
-        let response: Value = serde_json::from_str(&line).expect("plugin JSON response");
-        assert_eq!(
-            response.get("id").and_then(|v| v.as_u64()),
-            Some(id),
-            "{response}"
-        );
-        if let Some(error) = response.get("error") {
-            panic!("{method} returned JSON-RPC error: {error}");
+        loop {
+            let line = self
+                .lines
+                .recv_timeout(Duration::from_secs(40))
+                .unwrap_or_else(|err| panic!("plugin did not answer {method}: {err}"))
+                .expect("read plugin response");
+            let response: Value = serde_json::from_str(&line).expect("plugin JSON response");
+            if response.get("method").and_then(|v| v.as_str()) == Some("plugin/settings/get") {
+                if let Some(req_id) = response.get("id") {
+                    let reply = json!({"jsonrpc": "2.0", "id": req_id, "result": {"settings": {}}});
+                    let stdin = self.stdin.as_mut().expect("plugin stdin is open");
+                    writeln!(stdin, "{reply}").expect("write settings reply");
+                    stdin.flush().expect("flush settings reply");
+                }
+                continue;
+            }
+            assert_eq!(
+                response.get("id").and_then(|v| v.as_u64()),
+                Some(id),
+                "{response}"
+            );
+            if let Some(error) = response.get("error") {
+                panic!("{method} returned JSON-RPC error: {error}");
+            }
+            return response.get("result").cloned().unwrap_or(Value::Null);
         }
-        response.get("result").cloned().unwrap_or(Value::Null)
     }
 
     pub fn initialize(&mut self) -> Value {

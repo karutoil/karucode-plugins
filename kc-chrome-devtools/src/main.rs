@@ -9,12 +9,50 @@
 //! table of the `[[plugins]]` entry) and is parsed by
 //! [`BrowserConfig::from_settings`].
 
-use kc_chrome_devtools::browser::{BrowserConfig, BrowserManager};
-use kc_plugin_sdk::{
-    hooks, permissions, PluginBuilder, PluginToolResult, PluginToolResultExt, ToolRequest,
+use kc_chrome_devtools::browser::{
+    BrowserConfig, BrowserManager, DEFAULT_VIEWPORT_HEIGHT, DEFAULT_VIEWPORT_WIDTH, MAX_VIEWPORT,
+    MIN_VIEWPORT,
 };
-use serde_json::{json, Value};
+use kc_plugin_sdk::{
+    hooks, permissions, HostClient, Plugin, PluginBuilder, PluginSetting, PluginSettingKind,
+    PluginToolResult, PluginToolResultExt, ToolRequest,
+};
+use serde_json::{json, Map, Value};
+use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
+
+fn merge_settings(env: Value, rpc: BTreeMap<String, Value>) -> Value {
+    let mut map = match env {
+        Value::Object(obj) => obj,
+        _ => Map::new(),
+    };
+    for (k, v) in rpc {
+        // If config.toml passed `extra_args = [...]` (array), the host's
+        // effective_settings drops it against our `text` schema and sends `""`.
+        // Preserve the env array unless the operator entered non-empty text.
+        if k == "extra_args"
+            && v.as_str().is_some_and(|s| s.trim().is_empty())
+            && map.get("extra_args").is_some_and(Value::is_array)
+        {
+            continue;
+        }
+        map.insert(k, v);
+    }
+    Value::Object(map)
+}
+
+fn load_effective_settings() -> Value {
+    let env = std::env::var("KARUCODE_PLUGIN_SETTINGS")
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+    let rpc = if HostClient::global().is_live() {
+        kc_plugin_sdk::settings()
+    } else {
+        BTreeMap::new()
+    };
+    merge_settings(env, rpc)
+}
 
 /// The manager is created on first use so a bad `settings` block fails the
 /// first tool call with a clear message instead of killing the plugin at
@@ -22,10 +60,7 @@ use std::sync::{Mutex, OnceLock};
 fn manager() -> &'static Mutex<BrowserManager> {
     static MANAGER: OnceLock<Mutex<BrowserManager>> = OnceLock::new();
     MANAGER.get_or_init(|| {
-        let settings = std::env::var("KARUCODE_PLUGIN_SETTINGS")
-            .ok()
-            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
-            .unwrap_or(Value::Null);
+        let settings = load_effective_settings();
         Mutex::new(BrowserManager::new(BrowserConfig::from_settings(&settings)))
     })
 }
@@ -68,8 +103,123 @@ fn mobile_layout_hint(has_meta: Option<bool>) -> bool {
 //
 // `read_only` is used only where the tool cannot change page state at all.
 
-fn main() -> std::io::Result<()> {
-    PluginBuilder::new("chrome-devtools", "0.1.0")
+fn declared_settings() -> Vec<PluginSetting> {
+    vec![
+        PluginSetting {
+            key: "headless".into(),
+            label: "Run browser headless".into(),
+            kind: PluginSettingKind::Bool,
+            default: json!(true),
+            help: "Launch Chrome/Chromium without a visible window.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "isolated".into(),
+            label: "Use throwaway browser profile".into(),
+            kind: PluginSettingKind::Bool,
+            default: json!(true),
+            help: "Isolate cookies and storage per plugin process unless user_data_dir is set.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "chrome_path".into(),
+            label: "Chrome/Chromium binary path".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(""),
+            help: "Optional path to the Chrome/Chromium executable (empty = auto-detect).".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "user_data_dir".into(),
+            label: "Persistent user data directory".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(""),
+            help: "Optional profile directory; setting this disables isolated mode.".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "viewport_width".into(),
+            label: "Default viewport width (px)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(DEFAULT_VIEWPORT_WIDTH),
+            help: "Initial desktop viewport width in CSS pixels.".into(),
+            min: Some(MIN_VIEWPORT as f64),
+            max: Some(MAX_VIEWPORT as f64),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "viewport_height".into(),
+            label: "Default viewport height (px)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(DEFAULT_VIEWPORT_HEIGHT),
+            help: "Initial desktop viewport height in CSS pixels.".into(),
+            min: Some(MIN_VIEWPORT as f64),
+            max: Some(MAX_VIEWPORT as f64),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "protocol_timeout_secs".into(),
+            label: "CDP command timeout (seconds)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(30),
+            help: "How long a single DevTools command may wait before failing.".into(),
+            min: Some(1.0),
+            max: Some(600.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "startup_timeout_secs".into(),
+            label: "Browser startup timeout (seconds)".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(30),
+            help: "How long to wait for Chrome's DevTools endpoint after launch.".into(),
+            min: Some(1.0),
+            max: Some(600.0),
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "extra_args".into(),
+            label: "Extra Chromium flags".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(""),
+            help: "Space-separated Chromium CLI flags (for example: --no-sandbox).".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "snapshot_dir".into(),
+            label: "Heap snapshot directory".into(),
+            kind: PluginSettingKind::Text,
+            default: json!(""),
+            help: "Optional directory for saved V8 heap snapshots (empty = temp dir).".into(),
+            min: None,
+            max: None,
+            options: Vec::new(),
+        },
+        PluginSetting {
+            key: "max_snapshot_nodes".into(),
+            label: "Max accessibility snapshot nodes".into(),
+            kind: PluginSettingKind::Number,
+            default: json!(2500),
+            help: "Default cap on rendered accessibility tree nodes in take_snapshot.".into(),
+            min: Some(50.0),
+            max: Some(100_000.0),
+            options: Vec::new(),
+        },
+    ]
+}
+
+fn build_plugin() -> Plugin {
+    let mut builder = PluginBuilder::new("chrome-devtools", "0.1.0")
         .description(
             "Drive and inspect a real Chrome/Chromium browser: navigate, read the \
              accessibility tree, click and type by element uid, run script, capture \
@@ -78,7 +228,11 @@ fn main() -> std::io::Result<()> {
         // The plugin launches a browser process and opens sockets, so it needs
         // both. Without these the host would not expose the tools at all.
         .permission(permissions::SHELL)
-        .permission(permissions::NETWORK)
+        .permission(permissions::NETWORK);
+    for setting in declared_settings() {
+        builder = builder.setting(setting);
+    }
+    builder
         .tool_with_class(
             "list_pages",
             "List the open browser pages with their pageId, URL and title. Call this \
@@ -588,5 +742,37 @@ fn main() -> std::io::Result<()> {
                  get element uids before clicking or filling."
             ))
         })
-        .run()
+        .build()
+}
+
+fn main() -> std::io::Result<()> {
+    build_plugin().run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn declared_settings_pass_host_validation() {
+        let plugin = build_plugin();
+        let settings = &plugin.manifest().settings;
+        assert_eq!(settings.len(), 11);
+        kc_plugin_sdk::validate_settings(settings).expect("settings must be valid");
+    }
+
+    #[test]
+    fn merge_settings_preserves_env_array_extra_args_over_empty_rpc_default() {
+        let env = json!({
+            "extra_args": ["--no-sandbox"],
+            "headless": true
+        });
+        let mut rpc = BTreeMap::new();
+        rpc.insert("extra_args".into(), json!(""));
+        rpc.insert("headless".into(), json!(false));
+        let merged = merge_settings(env, rpc);
+        let cfg = BrowserConfig::from_settings(&merged);
+        assert!(!cfg.headless);
+        assert_eq!(cfg.extra_args, vec!["--no-sandbox".to_string()]);
+    }
 }

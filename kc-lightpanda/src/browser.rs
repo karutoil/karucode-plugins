@@ -57,47 +57,77 @@ impl Default for BrowserConfig {
     }
 }
 
+fn json_u64(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| {
+        value
+            .as_f64()
+            .filter(|f| f.is_finite() && *f >= 0.0 && *f <= u64::MAX as f64)
+            .map(|f| f.round() as u64)
+    })
+}
+
+fn non_empty_str(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 impl BrowserConfig {
     pub fn from_settings(settings: &Value) -> Self {
         let mut config = Self::default();
-        if let Some(value) = settings.get("browser_path").and_then(|v| v.as_str()) {
-            config.browser_path = Some(value.to_string());
+        if let Some(value) = settings.get("browser_path").and_then(non_empty_str) {
+            config.browser_path = Some(value);
         }
-        if let Some(value) = settings.get("web_socket_url").and_then(|v| v.as_str()) {
-            if !value.trim().is_empty() {
-                config.web_socket_url = Some(value.trim().to_string());
-            }
+        if let Some(value) = settings.get("web_socket_url").and_then(non_empty_str) {
+            config.web_socket_url = Some(value);
         }
         if let Some(viewport) = settings.get("viewport") {
-            let width = viewport.get("width").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            let height = viewport.get("height").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let width = viewport.get("width").and_then(json_u64).unwrap_or(0) as u32;
+            let height = viewport.get("height").and_then(json_u64).unwrap_or(0) as u32;
             if width > 0 && height > 0 {
-                config.viewport = (width, height);
+                config.viewport = (
+                    width.clamp(MIN_VIEWPORT, MAX_VIEWPORT),
+                    height.clamp(MIN_VIEWPORT, MAX_VIEWPORT),
+                );
             }
         }
-        if let Some(value) = settings
-            .get("protocol_timeout_secs")
-            .and_then(|v| v.as_u64())
-        {
-            config.protocol_timeout_secs = value.max(1);
+        let has_viewport_obj = settings.get("viewport").is_some_and(|v| v.is_object());
+        if let Some(w) = settings.get("viewport_width").and_then(json_u64) {
+            let w = (w as u32).clamp(MIN_VIEWPORT, MAX_VIEWPORT);
+            if !has_viewport_obj || w != DEFAULT_VIEWPORT_WIDTH {
+                config.viewport.0 = w;
+            }
         }
-        if let Some(value) = settings
-            .get("startup_timeout_secs")
-            .and_then(|v| v.as_u64())
-        {
-            config.startup_timeout_secs = value.max(1);
+        if let Some(h) = settings.get("viewport_height").and_then(json_u64) {
+            let h = (h as u32).clamp(MIN_VIEWPORT, MAX_VIEWPORT);
+            if !has_viewport_obj || h != DEFAULT_VIEWPORT_HEIGHT {
+                config.viewport.1 = h;
+            }
         }
-        if let Some(value) = settings.get("screenshot_dir").and_then(|v| v.as_str()) {
-            config.screenshot_dir = Some(value.to_string());
+        if let Some(value) = settings.get("protocol_timeout_secs").and_then(json_u64) {
+            config.protocol_timeout_secs = value.clamp(1, 600);
         }
-        if let Some(value) = settings.get("max_snapshot_nodes").and_then(|v| v.as_u64()) {
+        if let Some(value) = settings.get("startup_timeout_secs").and_then(json_u64) {
+            config.startup_timeout_secs = value.clamp(1, 600);
+        }
+        if let Some(value) = settings.get("screenshot_dir").and_then(non_empty_str) {
+            config.screenshot_dir = Some(value);
+        }
+        if let Some(value) = settings.get("max_snapshot_nodes").and_then(json_u64) {
             config.max_snapshot_nodes = value.clamp(1, 100_000) as usize;
         }
-        if let Some(value) = settings.get("extra_args").and_then(|v| v.as_array()) {
-            config.extra_args = value
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect();
+        if let Some(extra) = settings.get("extra_args") {
+            if let Some(list) = extra.as_array() {
+                config.extra_args = list
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()))
+                    .map(str::to_string)
+                    .collect();
+            } else if let Some(text) = extra.as_str() {
+                config.extra_args = text.split_whitespace().map(str::to_string).collect();
+            }
         }
         if let Some(value) = settings.get("obey_robots").and_then(|v| v.as_bool()) {
             config.obey_robots = value;
