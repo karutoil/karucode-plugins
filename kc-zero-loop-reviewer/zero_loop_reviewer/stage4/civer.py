@@ -29,6 +29,7 @@ from typing import Callable, Protocol, Sequence
 
 from pydantic import ValidationError
 
+from ..adapters import ProbeAdapter, adapter_for
 from ..config import Settings
 from ..errors import LLMError
 from ..gitops import GitError, GitRepo
@@ -206,7 +207,7 @@ def verify_fix(
         checks.append("patch_applies: git apply --check")
 
         syntax_commands, unavailable = _syntax_commands(
-            _patch_paths(proposal.patch), patched, tool_root
+            _patch_paths(proposal.patch), patched, tool_root, settings.probe_adapters
         )
         if unavailable:
             return _fail(f"syntax_checker_unavailable: {unavailable}", checks)
@@ -440,7 +441,10 @@ def _linter_argv(linter: Sequence[str] | None, settings: Settings) -> list[str]:
 
 
 def _syntax_commands(
-    files: Sequence[str], tree: Path, tool_root: Path | None
+    files: Sequence[str],
+    tree: Path,
+    tool_root: Path | None,
+    adapters: Sequence[ProbeAdapter] = (),
 ) -> tuple[list[tuple[str, list[str]]], str]:
     """Language-aware parse checks for the *patched* tree.
 
@@ -487,6 +491,17 @@ def _syntax_commands(
                     ],
                 )
             )
+    # Custom adapters may provide an exact syntax command for languages this
+    # package does not know.  It is used only for files no built-in covered.
+    covered = {path for path in existing if path.endswith((".py", ".pyi", ".rs", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"))}
+    for path in existing:
+        if path in covered:
+            continue
+        adapter = adapter_for(path, adapters)
+        if adapter is None or not adapter.syntax_command:
+            continue
+        command = [part.replace("{path}", path) for part in adapter.syntax_command]
+        commands.append((f"custom_{adapter.name}_syntax", command))
     return commands, ""
 
 
@@ -497,9 +512,18 @@ def _find_esbuild(tool_root: Path | None) -> str | None:
         candidates.extend(
             [
                 root / "web" / "node_modules" / ".bin" / "esbuild",
+                root / "frontend" / "node_modules" / ".bin" / "esbuild",
                 root / "node_modules" / ".bin" / "esbuild",
             ]
         )
+        # Any monorepo layout, one or two levels deep, without walking
+        # node_modules itself.
+        for pattern in (
+            "*/node_modules/.bin/esbuild",
+            "*/*/node_modules/.bin/esbuild",
+            "*/web/node_modules/.bin/esbuild",
+        ):
+            candidates.extend(root.glob(pattern))
     for candidate in candidates:
         if candidate.is_file():
             return str(candidate)

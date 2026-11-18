@@ -9,12 +9,14 @@ and posts exactly once.
 from __future__ import annotations
 
 import concurrent.futures
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from .adapters import BUILTIN_ADAPTERS, ProbeAdapter, adapter_for
 from .config import Settings, StageModel, ensure_state_dirs
 from .errors import ContractViolation, LLMError, ReviewError
 from .gitops import GitError, GitRepo
@@ -557,6 +559,7 @@ class Reviewer:
             return []
         batches, capped_batches, oversized = _behavioral_batches(
             diff,
+            adapters=self.settings.probe_adapters,
             max_batches=(
                 EXHAUSTIVE_BEHAVIOR_BATCHES
                 if self.settings.exhaustive
@@ -615,7 +618,7 @@ class Reviewer:
                 sites = [
                     site
                     for site in draft.cited_sites
-                    if _site_in_diff(scope, site) and _groundable(site, analyzer_findings)
+                    if _site_in_diff(scope, site) and _groundable(site, analyzer_findings, self.settings.probe_adapters)
                 ]
                 if not sites:
                     rejected += 1
@@ -734,7 +737,7 @@ class Reviewer:
         required = {
             (patch.path, line)
             for patch in diff.files
-            if _behavioral_eligible(patch) and not _is_test_path(patch.path)
+            if _behavioral_eligible(patch, self.settings.probe_adapters) and not _is_test_path(patch.path)
             for line in patch.changed_lines
         }
         covered = {
@@ -798,7 +801,7 @@ class Reviewer:
                 updated.append(candidate)
                 run.degraded.append("probe_coverage_incomplete: the deadline ended probe synthesis")
                 continue
-            if not _probe_supported(candidate):
+            if not _probe_supported(candidate, self.settings.probe_adapters):
                 updated.append(candidate)
                 self._record(
                     "3.probe",
@@ -866,7 +869,7 @@ class Reviewer:
             # a 5-vote LLM fallback adds no mechanical evidence for them.  The
             # fallback is only for probe-capable candidates whose probe did not
             # produce a usable pair.
-            if not _probe_supported(candidate):
+            if not _probe_supported(candidate, self.settings.probe_adapters):
                 continue
             pair = candidate.verification.probe
             if (
@@ -1589,7 +1592,14 @@ def _site_in_diff(diff: DiffBundle, site: CitedSite) -> bool:
 _BEHAVIOR_EXTENSIONS = {
     ".py", ".pyi", ".rs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
     ".go", ".java", ".kt", ".rb", ".php", ".c", ".h", ".cc", ".cpp", ".hpp",
-    ".cs", ".swift", ".scala", ".ex", ".exs",
+    ".cs", ".swift", ".scala", ".ex", ".exs", ".lua", ".dart", ".vue",
+    ".svelte", ".erb", ".twig", ".m", ".mm", ".fs", ".fsx", ".jl", ".pl", ".pm",
+}
+_NON_CODE_SUFFIXES = {
+    ".md", ".rst", ".txt", ".json", ".jsonl", ".ndjson", ".yaml", ".yml",
+    ".toml", ".ini", ".cfg", ".lock", ".sum", ".mod", ".snap", ".csv", ".tsv",
+    ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".pdf", ".zip",
+    ".gz", ".tar", ".woff", ".woff2", ".ttf", ".map",
 }
 _BEHAVIOR_SKIP_PARTS = {
     "node_modules", "target", "dist", "build", "vendor", "third_party",
@@ -1601,13 +1611,24 @@ _BEHAVIOR_RISK_WORDS = (
 )
 
 
-def _behavioral_eligible(patch: FilePatch) -> bool:
+def _behavioral_eligible(
+    patch: FilePatch, adapters: Sequence[ProbeAdapter] = BUILTIN_ADAPTERS
+) -> bool:
     if patch.is_binary or patch.is_deleted or not patch.changed_lines:
         return False
     path = patch.path.replace("\\", "/")
     if any(part in _BEHAVIOR_SKIP_PARTS for part in Path(path).parts):
         return False
-    return Path(path).suffix.lower() in _BEHAVIOR_EXTENSIONS
+    if adapter_for(path, adapters) is not None:
+        return True
+    suffix = Path(path).suffix.lower()
+    if not suffix:
+        return True
+    if suffix in _NON_CODE_SUFFIXES:
+        return False
+    # Unknown languages still get an LLM review; only an adapter or an
+    # analyzer rule can turn one of those hypotheses into a verified finding.
+    return True
 
 
 def _behavioral_weight(patch: FilePatch) -> int:
@@ -1630,6 +1651,11 @@ def _is_test_path(path: str) -> bool:
         or ".spec." in low
         or low.endswith("_test.py")
         or low.endswith("_test.rs")
+        or re.search(
+            r"(_test|_spec)\.(go|rb|php|exs|ex|cs|swift|lua|kt|java|scala|c|cc|cpp|h|hpp|fs|fsx|jl|pl|pm)$",
+            low,
+        )
+        is not None
     )
 
 
@@ -1740,6 +1766,7 @@ def _behavioral_batches(
     *,
     max_batches: int = MAX_BEHAVIOR_BATCHES,
     plan: ChangePlan | None = None,
+    adapters: Sequence[ProbeAdapter] = BUILTIN_ADAPTERS,
 ) -> tuple[list[list[FilePatch]], bool, bool]:
     """Rank changed source files and group them into evidence-sized batches.
 
@@ -1748,7 +1775,7 @@ def _behavioral_batches(
     they are split over several size-bounded batches.
     """
     files = sorted(
-        (patch for patch in diff.files if _behavioral_eligible(patch)),
+        (patch for patch in diff.files if _behavioral_eligible(patch, adapters)),
         key=lambda patch: (-_behavioral_weight(patch), patch.path),
     )
     if not files:
@@ -1821,21 +1848,20 @@ def _context_for_batch(context: ContextSlice, paths: set[str]) -> ContextSlice:
     return context.model_copy(update={"text": text, "tokens": max(1, len(text) // 4)})
 
 
-def _probe_supported(candidate: Candidate) -> bool:
-    """Probe synthesis supports Python, Rust, Go and JavaScript/TypeScript.
-
-    A probe still has to compile and assert in the sandbox; an unsupported
-    toolchain produces a setup error and the candidate stays unverified.
-    """
+def _probe_supported(
+    candidate: Candidate, adapters: Sequence[ProbeAdapter] = BUILTIN_ADAPTERS
+) -> bool:
+    """Whether a configured language adapter can run a probe for this site."""
     if not candidate.cited_sites:
         return False
-    path = candidate.cited_sites[0].path
-    if path.endswith((".py", ".pyi", ".go", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".rs")):
-        return True
-    return False
+    return adapter_for(candidate.cited_sites[0].path, adapters) is not None
 
 
-def _groundable(site: CitedSite, findings: Sequence[AnalyzerFinding]) -> bool:
+def _groundable(
+    site: CitedSite,
+    findings: Sequence[AnalyzerFinding],
+    adapters: Sequence[ProbeAdapter] = BUILTIN_ADAPTERS,
+) -> bool:
     """Whether the stack can *test* a hypothesis about this site.
 
     Stage 3 can execute a Python, Rust, Go or JavaScript/TypeScript probe; a
@@ -1844,7 +1870,7 @@ def _groundable(site: CitedSite, findings: Sequence[AnalyzerFinding]) -> bool:
     must not become a candidate: otherwise every clean docs/workflow PR ends in
     an unverified human review.
     """
-    if site.path.endswith((".py", ".pyi", ".go", ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".rs")):
+    if adapter_for(site.path, adapters) is not None:
         return True
     return any(
         finding.path == site.path

@@ -22,6 +22,7 @@ from __future__ import annotations
 import re
 from typing import Any, Callable, Sequence
 
+from ..adapters import BUILTIN_ADAPTERS, ProbeAdapter, adapter_for
 from ..config import Settings
 from ..errors import FailureKind, LLMError, SandboxError
 from ..llm.prompts import probe_prompt
@@ -47,11 +48,11 @@ _LANGUAGES = {
 
 
 def language_for(path: str) -> tuple[str, str]:
-    """Return ``(language, framework)`` for a candidate path."""
-    for suffix, pair in _LANGUAGES.items():
-        if path.endswith(suffix):
-            return pair
-    return ("unknown", "")
+    """Return ``(language, framework)`` for a built-in candidate path."""
+    adapter = adapter_for(path, BUILTIN_ADAPTERS)
+    if adapter is None:
+        return ("unknown", "")
+    return (adapter.language, adapter.framework)
 
 #: A probe must assert something a defect can break.
 _ASSERTION = re.compile(
@@ -107,22 +108,39 @@ def has_boundary(content: str) -> bool:
     return any(token in low for token in _BOUNDARY_TOKENS)
 
 
-def inspect_probe(spec: ProbeSpec, *, language: str = "") -> list[str]:
+def inspect_probe(spec: ProbeSpec, *, language: str = "", adapter: ProbeAdapter | None = None) -> list[str]:
     """Everything wrong with a proposed probe, as human-readable problems."""
     issues: list[str] = []
     rel_path = ""
     try:
-        rel_path = probe_relative_path(spec.test_path)
+        rel_path = probe_relative_path(
+            spec.test_path, extensions=adapter.extensions if adapter is not None else None
+        )
     except SandboxError as exc:
         issues.append(str(exc))
-    if language:
+    if adapter is None:
         expected = language
+        framework = ""
+        if not expected:
+            builtin = adapter_for(rel_path or spec.test_path, BUILTIN_ADAPTERS)
+            expected = builtin.language if builtin is not None else ""
+            framework = builtin.framework if builtin is not None else ""
     else:
-        expected, framework = language_for(rel_path or spec.test_path)
-        if not spec.framework or spec.framework == "pytest":
-            spec = spec.model_copy(update={"framework": framework or spec.framework})
+        expected = adapter.language
+        framework = adapter.framework
+    if framework and spec.framework in ("", "pytest") and framework != "pytest":
+        spec = spec.model_copy(update={"framework": framework})
     content = spec.content or ""
-    if expected == "python":
+    if adapter is not None and not adapter.builtin:
+        if not adapter.accepts(rel_path or spec.test_path):
+            issues.append(f"the probe path does not match {adapter.name!r} extensions {list(adapter.extensions)}")
+        if adapter.test_marker and adapter.test_marker.lower() not in content.lower():
+            issues.append(f"the probe does not contain the {adapter.name!r} test marker {adapter.test_marker!r}")
+        if adapter.assertion_marker and adapter.assertion_marker.lower() not in content.lower():
+            issues.append(f"the probe does not contain the {adapter.name!r} assertion marker {adapter.assertion_marker!r}")
+        if spec.framework != adapter.framework:
+            issues.append(f"a {adapter.name!r} probe must use framework={adapter.framework!r}")
+    elif expected == "python":
         try:
             compile(content, "<probe>", "exec")
         except SyntaxError as exc:
@@ -152,7 +170,7 @@ def inspect_probe(spec: ProbeSpec, *, language: str = "") -> list[str]:
             issues.append("a TypeScript/JavaScript probe must assert with node:test/node:assert or expect()")
     else:
         issues.append(f"the probe language is not supported: {rel_path or spec.test_path}")
-    if not has_assertion(content):
+    if (adapter is None or adapter.builtin) and not has_assertion(content):
         issues.append(
             "the probe has no assertion on a return value or on state; a probe that cannot fail is not a probe"
         )
@@ -195,8 +213,11 @@ def synthesize(
     attempts = max(1, min(MAX_ATTEMPTS, int(max_attempts), configured))
     files = [str(path) for path in (project_files or ())][:200]
     language, framework = ("", "")
+    adapter: ProbeAdapter | None = None
     if candidate.cited_sites:
-        language, framework = language_for(candidate.cited_sites[0].path)
+        adapter = adapter_for(candidate.cited_sites[0].path, settings.probe_adapters)
+        if adapter is not None:
+            language, framework = adapter.language, adapter.framework
     problems: list[str] = []
     previous = ""
     for attempt in range(1, attempts + 1):
@@ -208,6 +229,7 @@ def synthesize(
             project_files=files,
             language=language,
             framework=framework,
+            adapter=adapter,
         )
         try:
             answer = llm.complete("probe", prompt, ProbeSpec, stage_model=settings.llm.probe)
@@ -226,11 +248,15 @@ def synthesize(
             previous = "the answer was not a ProbeSpec object"
             problems.append(f"attempt {attempt}: {previous}")
             continue
-        if not language:
+        if adapter is None:
+            adapter = adapter_for(spec.test_path, settings.probe_adapters)
+        if adapter is not None:
+            language, framework = adapter.language, adapter.framework
+        elif not language:
             language, framework = language_for(spec.test_path)
         if framework and spec.framework in ("pytest", "") and framework != "pytest":
             spec = spec.model_copy(update={"framework": framework})
-        issues = inspect_probe(spec, language=language)
+        issues = inspect_probe(spec, language=language, adapter=adapter)
         if validate is not None and not issues:
             try:
                 verdict = str(validate(spec) or "").strip()
@@ -242,5 +268,11 @@ def synthesize(
             previous = "; ".join(issues)
             problems.append(f"attempt {attempt}: {previous}")
             continue
-        return spec.model_copy(update={"test_path": probe_relative_path(spec.test_path)}), problems
+        return spec.model_copy(
+            update={
+                "test_path": probe_relative_path(
+                    spec.test_path, extensions=adapter.extensions if adapter is not None else None
+                )
+            }
+        ), problems
     return None, problems

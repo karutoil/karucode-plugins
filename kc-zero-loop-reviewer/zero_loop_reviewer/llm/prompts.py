@@ -12,6 +12,7 @@ from typing import Any, Sequence
 
 from pydantic import BaseModel
 
+from ..adapters import ProbeAdapter
 from ..models import (
     AnalyzerFinding,
     BehavioralCandidates,
@@ -176,6 +177,7 @@ def probe_prompt(
     project_files: Sequence[str] = (),
     language: str = "python",
     framework: str = "pytest",
+    adapter: ProbeAdapter | None = None,
 ) -> Prompt:
     language_rules = {
         "python": (
@@ -202,6 +204,15 @@ def probe_prompt(
             "the sandbox runs `go test`."
         ),
     }.get(language, "Use the project's existing test framework.")
+    if adapter is not None and not adapter.builtin:
+        command = " ".join(adapter.command).replace("{test_path}", adapter.test_path).replace("{name}", "probe")
+        language_rules = (
+            f"One test file at `{adapter.test_path.replace('{name}', 'probe')}` using the project's "
+            f"{adapter.language} test framework. The file must contain `{adapter.test_marker or 'a test'}`, "
+            f"and assert with `{adapter.assertion_marker or 'the project assertion'}`. "
+            f"Use `framework: {adapter.framework}`. The sandbox will run: `{command}`. "
+            "Do not add dependencies or use the network."
+        )
     user = _join(
         _schema("ProbeSpec", ProbeSpec),
         _evidence("defect_card", candidate.model_dump(mode="json"), 12000),

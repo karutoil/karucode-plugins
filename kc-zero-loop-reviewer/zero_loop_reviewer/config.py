@@ -24,6 +24,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Mapping
 
+from .adapters import BUILTIN_ADAPTERS, ProbeAdapter, parse_adapters
+
 # --------------------------------------------------------------------------- #
 # Declarations shown in Settings → Plugins & MCP (max 32, host limit)
 # --------------------------------------------------------------------------- #
@@ -71,13 +73,6 @@ SETTING_DECLARATIONS: list[dict[str, Any]] = [
         "type": "text",
         "default": "",
         "help": "Empty = primary. Use a second provider's model when monitor independence is critical.",
-    },
-    {
-        "key": "model.monitor_alt",
-        "label": "Second-provider monitor model",
-        "type": "text",
-        "default": "",
-        "help": "Optional: a model on another provider, used for monitor independence.",
     },
     {
         "key": "llm.base_url",
@@ -137,6 +132,13 @@ SETTING_DECLARATIONS: list[dict[str, Any]] = [
         "help": "Reflexion iterations per candidate (1–3).",
         "min": 1,
         "max": 3,
+    },
+    {
+        "key": "probe.adapters",
+        "label": "Language adapters (JSON)",
+        "type": "text",
+        "default": "",
+        "help": "Optional JSON object/array adding a test adapter for any language (extensions, test_path, image, command, markers). Empty = built-ins only.",
     },
     {
         "key": "fusion.c_fr",
@@ -465,6 +467,7 @@ class Settings:
     deadline_s: float = 240.0
     stage2_timeout_s: float = 60.0
     probe_attempts: int = 3
+    probe_adapters: tuple[ProbeAdapter, ...] = BUILTIN_ADAPTERS
     max_findings: int = 0
     designlore_files: tuple[str, ...] = (
         "AGENTS.md",
@@ -472,7 +475,19 @@ class Settings:
         ".pr_agent.toml",
         ".zero_loop/designlore.json",
     )
-    important_files: tuple[str, ...] = ("AGENTS.md", "README.md", "pyproject.toml")
+    important_files: tuple[str, ...] = (
+        "AGENTS.md",
+        "README.md",
+        "pyproject.toml",
+        "package.json",
+        "Cargo.toml",
+        "go.mod",
+        "Gemfile",
+        "composer.json",
+        "pom.xml",
+        "build.gradle",
+        "Makefile",
+    )
 
     # ---- endpoint resolution ------------------------------------------------
     def llm_base_url(self, environ: Mapping[str, str] | None = None) -> str:
@@ -605,6 +620,8 @@ def _merged(settings: Mapping[str, Any], environ: Mapping[str, str], file_values
         "llm.response_format",
         "review.exhaustive",
         "review.decomposition",
+        "model.monitor_alt",
+        "probe.adapters",
         "model.reasoning_effort",
         "model.triage_reasoning_effort",
         "model.security_reasoning_effort",
@@ -801,6 +818,10 @@ def load_settings(
     paths = default_paths(state_dir)
     paths = replace(paths, private_log=state_dir / redaction.private_log_name)
 
+    try:
+        adapters = parse_adapters(get("probe.adapters", ""))
+    except ValueError as exc:
+        raise SettingError(f"probe.adapters: {exc}") from exc
     return Settings(
         llm=llm,
         fusion=fusion,
@@ -817,6 +838,7 @@ def load_settings(
         stage2_timeout_s=float(get("review.stage2_timeout_secs", 60)),
         probe_attempts=max(1, min(3, int(get("review.probe_attempts", 3)))),
         max_findings=max(0, min(50, int(get("review.max_findings", 0)))),
+        probe_adapters=adapters,
     )
 
 

@@ -38,14 +38,16 @@ non-behavioural outcome is reported as ``setup_error``/``timeout``/
 from __future__ import annotations
 
 import re
+import shlex
 import shutil
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Mapping, Protocol, Sequence, runtime_checkable
 
+from ..adapters import BUILTIN_ADAPTERS, ProbeAdapter, adapter_for, adapters_map
 from ..config import Settings
 from ..errors import SandboxError
 from ..models import AttemptStatus, ProbeResult, ProbeSpec, ProbeStatus
@@ -103,6 +105,7 @@ _BEHAVIOURAL_MARKERS: tuple[tuple[str, str], ...] = (
     ("assertionerror", "assertion"),
     ("e   assert", "assertion"),
     ("failed ", "assertion"),
+    ("failed\n", "assertion"),
     ("exception raised", "exception"),
     ("test result: failed", "assertion"),
     ("panicked at", "panic"),
@@ -147,6 +150,7 @@ class SandboxConfigView:
     local_fallback: bool = False
     work_dir: Path = Path.home() / ".local/state/zero-loop-reviewer/work"
     visible_roots: tuple[str, ...] = ("/home",)
+    adapters: Mapping[str, ProbeAdapter] = field(default_factory=lambda: adapters_map(BUILTIN_ADAPTERS))
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "SandboxConfigView":
@@ -166,12 +170,16 @@ class SandboxConfigView:
             extra_args=tuple(sandbox.extra_args),
             local_fallback=bool(sandbox.local_fallback),
             work_dir=Path(settings.paths.work_dir),
+            adapters=adapters_map(settings.probe_adapters),
         )
 
     def scratch_parent(self) -> Path:
         return Path(self.work_dir)
 
     def image_for(self, framework: str) -> str:
+        adapter = self.adapters.get(framework)
+        if adapter is not None and adapter.image:
+            return adapter.image
         if framework == "cargo":
             return self.rust_image
         if framework in ("node", "tsx"):
@@ -203,7 +211,7 @@ class SandboxConfigView:
 # --------------------------------------------------------------------------- #
 
 
-def probe_relative_path(test_path: str) -> str:
+def probe_relative_path(test_path: str, *, extensions: tuple[str, ...] | None = None) -> str:
     """Normalise a probe path and refuse anything that could leave the worktree."""
     text = str(test_path or "").strip().replace("\\", "/")
     while text.startswith("./"):
@@ -214,9 +222,11 @@ def probe_relative_path(test_path: str) -> str:
         raise SandboxError(f"probe path {test_path!r} must stay inside the worktree")
     if not _SAFE_RELATIVE.match(text):
         raise SandboxError(f"probe path {test_path!r} contains characters a shell would interpret")
-    if not text.endswith((".py", ".rs", ".go", ".ts", ".tsx", ".js", ".mjs", ".cjs")):
+    allowed = extensions or (".py", ".rs", ".go", ".ts", ".tsx", ".js", ".mjs", ".cjs")
+    suffix = Path(text).suffix.lower()
+    if suffix not in allowed:
         raise SandboxError(
-            f"probe path {test_path!r} is not a Python, Rust, TypeScript or JavaScript file"
+            f"probe path {test_path!r} does not end in one of {list(allowed)}"
         )
     if text.endswith(".go") and not text.endswith("_test.go"):
         raise SandboxError("a Go probe must be a *_test.go file")
@@ -225,10 +235,36 @@ def probe_relative_path(test_path: str) -> str:
     return text
 
 
-def probe_argv(python: str, rel_path: str, *, framework: str = "pytest") -> list[str]:
+def _expand_command(command: Sequence[str], rel_path: str) -> list[str]:
+    values = {
+        "{test_path}": rel_path,
+        "{test_dir}": str(Path(rel_path).parent) or ".",
+        "{test_stem}": Path(rel_path).stem,
+        "{name}": Path(rel_path).stem,
+    }
+    out: list[str] = []
+    for part in command:
+        for needle, value in values.items():
+            part = part.replace(needle, value)
+        out.append(part)
+    return out
+
+
+def probe_argv(
+    python: str,
+    rel_path: str,
+    *,
+    framework: str = "pytest",
+    adapter_command: Sequence[str] | None = None,
+) -> list[str]:
     """The command the local runner executes once the probe file is in place."""
     target = f"./{rel_path}"
-    if framework == "cargo":
+    if adapter_command:
+        return _expand_command(adapter_command, rel_path)
+    if adapter_command:
+        preflight = ""
+        command = " ".join(shlex.quote(part) for part in _expand_command(adapter_command, rel_path))
+    elif framework == "cargo":
         stem = Path(rel_path).stem
         crate = rel_path.split("/tests/", 1)[0] if "/tests/" in rel_path else "."
         return [
@@ -256,7 +292,14 @@ def probe_argv(python: str, rel_path: str, *, framework: str = "pytest") -> list
     return [python, "-m", "pytest", target, "-q", "-p", "no:cacheprovider"]
 
 
-def probe_script(rel_path: str, expected_sha: str, *, framework: str = "pytest", image: str = "") -> str:
+def probe_script(
+    rel_path: str,
+    expected_sha: str,
+    *,
+    framework: str = "pytest",
+    image: str = "",
+    adapter_command: Sequence[str] | None = None,
+) -> str:
     """The POSIX shell script that runs inside the container.
 
     Order matters: verify the delivered bytes, verify the image can run the
@@ -265,7 +308,10 @@ def probe_script(rel_path: str, expected_sha: str, *, framework: str = "pytest",
     target = f"{PROBE_ROOT}/{rel_path}"
     # The image name only appears in a human-readable message; keep it inert.
     safe_image = "".join(ch for ch in (image or "(unknown)") if ch not in '"\\$`\n')
-    if framework == "cargo":
+    if adapter_command:
+        preflight = ""
+        command = " ".join(shlex.quote(part) for part in _expand_command(adapter_command, rel_path))
+    elif framework == "cargo":
         stem = Path(rel_path).stem
         crate = rel_path.split("/tests/", 1)[0] if "/tests/" in rel_path else "."
         preflight = (
@@ -587,7 +633,9 @@ class PodmanSandbox:
         if not cwd.is_dir():
             cwd = Path.home()
         images = []
-        for image in (self.view.image, self.view.rust_image, self.view.node_image, self.view.go_image):
+        candidates = [self.view.image, self.view.rust_image, self.view.node_image, self.view.go_image]
+        candidates.extend(adapter.image for adapter in self.view.adapters.values() if adapter.image)
+        for image in candidates:
             if image and image not in images:
                 images.append(image)
         errors: list[str] = []
@@ -612,6 +660,11 @@ class PodmanSandbox:
         )
 
     # -- execution --------------------------------------------------------
+    def _adapter_for(self, spec: ProbeSpec) -> ProbeAdapter | None:
+        unique = {id(item): item for item in self.view.adapters.values()}
+        by_path = adapter_for(spec.test_path, list(unique.values()))
+        return by_path or self.view.adapters.get(spec.framework)
+
     def run_probe(
         self,
         worktree: Path,
@@ -622,8 +675,11 @@ class PodmanSandbox:
     ) -> ProbeResult:
         started = time.monotonic()
         image = self.view.image_for(spec.framework)
+        adapter = self._adapter_for(spec)
         try:
-            rel_path = probe_relative_path(spec.test_path)
+            rel_path = probe_relative_path(
+                spec.test_path, extensions=adapter.extensions if adapter is not None else None
+            )
         except SandboxError as exc:
             return ProbeResult(
                 status=ProbeStatus.MALFORMED_PROBE,
@@ -651,6 +707,7 @@ class PodmanSandbox:
                 delivered_sha,
                 framework=spec.framework,
                 image=image,
+                adapter_command=adapter.command if adapter is not None and not adapter.builtin else None,
             )
             argv = container_argv(self.view, scratch, script)
             run = run_bounded(
@@ -702,6 +759,11 @@ class LocalSandbox:
                 return True, f"local {binary} (no isolation)"
         return False, "no Python, cargo, node or npx runner is available"
 
+    def _adapter_for(self, spec: ProbeSpec) -> ProbeAdapter | None:
+        unique = {id(item): item for item in self.view.adapters.values()}
+        by_path = adapter_for(spec.test_path, list(unique.values()))
+        return by_path or self.view.adapters.get(spec.framework)
+
     def run_probe(
         self,
         worktree: Path,
@@ -712,8 +774,11 @@ class LocalSandbox:
     ) -> ProbeResult:
         started = time.monotonic()
         image = f"local:{self.python}"
+        adapter = self._adapter_for(spec)
         try:
-            rel_path = probe_relative_path(spec.test_path)
+            rel_path = probe_relative_path(
+                spec.test_path, extensions=adapter.extensions if adapter is not None else None
+            )
         except SandboxError as exc:
             return ProbeResult(
                 status=ProbeStatus.MALFORMED_PROBE,
@@ -730,7 +795,12 @@ class LocalSandbox:
             if failure is not None:
                 return failure
             verified_sha = delivered_sha
-            argv = probe_argv(self.python, rel_path, framework=spec.framework)
+            argv = probe_argv(
+                self.python,
+                rel_path,
+                framework=spec.framework,
+                adapter_command=adapter.command if adapter is not None and not adapter.builtin else None,
+            )
             run = run_bounded(
                 argv,
                 cwd=scratch,

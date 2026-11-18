@@ -28,6 +28,7 @@ review.deadline_secs = 240
 review.stage2_timeout_secs = 60
 review.max_model_tokens = 500000
 review.probe_attempts = 3
+probe.adapters = ""
 review.max_findings = 0
 fusion.c_fr = 10
 fusion.c_fa = 1

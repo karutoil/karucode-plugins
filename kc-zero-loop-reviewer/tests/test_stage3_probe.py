@@ -267,3 +267,49 @@ def test_inspect_probe_accepts_a_go_probe() -> None:
         language="go",
     )
     assert issues == []
+
+
+def test_a_custom_language_adapter_drives_synthesis() -> None:
+    import json
+
+    from zero_loop_reviewer.config import load_settings
+
+    raw = json.dumps(
+        {
+            "shell": {
+                "extensions": [".sh"],
+                "test_path": "probe/run.sh",
+                "framework": "shell",
+                "command": ["sh", "{test_path}"],
+                "test_marker": "exit",
+                "assertion_marker": "exit 1",
+            }
+        }
+    )
+    settings = load_settings({"probe.adapters": raw}, {})
+    from zero_loop_reviewer.models import CitedSite, Evidence
+
+    candidate = Candidate(
+        id="c-custom",
+        stage=StageId.PROBE,
+        title="script exits zero on failure",
+        root_cause="the shell probe should fail",
+        evidence=Evidence(kind="llm_hypothesis"),
+        cited_sites=[CitedSite(path="scripts/check.sh", line=1)],
+    )
+    llm = ScriptedLLM(
+        answers={
+            "probe": [
+                ProbeSpec(
+                    test_path="probe/run.sh",
+                    content="#!/bin/sh\nif [ 0 -eq 0 ]; then echo failed; exit 1; fi\n",
+                    framework="shell",
+                )
+            ]
+        }
+    )
+    spec, problems = synthesize(candidate, _context(), llm, settings)
+    assert problems == []
+    assert spec is not None
+    assert spec.framework == "shell"
+    assert "framework: shell" in llm.calls[0]["prompt"].user

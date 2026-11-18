@@ -1,0 +1,103 @@
+name: Zero-Loop Review
+
+# A repository-agnostic starter workflow.  Copy it to .github/workflows/.
+#
+# Requirements:
+#   - vars.ZERO_LOOP_PLUGIN_REF       full 40-character plugin commit
+#   - vars.ZERO_LOOP_LLM_BASE_URL     OpenAI-compatible endpoint
+#   - secrets.ZERO_LOOP_LLM_API_KEY   model key
+#
+# Nothing here assumes a language, a package manager or a repository layout.
+# Python is only the reviewer runtime; the reviewed project does not need it.
+# Language probes use the images in probe.adapters/sandbox; a missing image or
+# toolchain is a setup error, never an approval.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: read
+
+jobs:
+  zero-loop:
+    if: |
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.ZERO_LOOP_PLUGIN_REPO || 'karutoil/karucode-plugins' }}
+          ref: ${{ vars.ZERO_LOOP_PLUGIN_REF }}
+          path: .zero-loop/plugin
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the reviewer runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "pydantic>=2.6" "httpx>=0.27" "semgrep>=1.90,<2"
+
+      - name: Pull the Python probe image
+        run: docker pull "${ZERO_LOOP_PYTHON_IMAGE:-docker.io/library/python:3.12-alpine}"
+
+      - name: Write a portable configuration
+        env:
+          BASE_URL: ${{ vars.ZERO_LOOP_LLM_BASE_URL }}
+        run: |
+          cat > "$RUNNER_TEMP/zero-loop.toml" <<EOF
+          [llm]
+          base_url = "${BASE_URL}"
+          api_key_env = "ZERO_LOOP_LLM_API_KEY"
+
+          [review]
+          deadline_secs = 3600
+          max_model_tokens = 500000
+          max_findings = 0
+
+          [sandbox]
+          runtime = "docker"
+          image = "docker.io/library/python:3.12-alpine"
+
+          [probe]
+          # Add adapters for your language here, e.g.:
+          # adapters = '{"ruby":{"extensions":[".rb"],"test_path":"test/zl_probe_{name}_test.rb","framework":"ruby","image":"ruby:3.3-alpine","command":["ruby","{test_path}"],"test_marker":"def test_","assertion_marker":"assert"}}'
+
+          [sast]
+          semgrep_bin = "semgrep"
+          timeout_secs = 55
+
+          [ci]
+          provider = "github"
+          token_env = "GITHUB_TOKEN"
+          EOF
+
+      - name: Run the review
+        env:
+          ZERO_LOOP_LLM_API_KEY: ${{ secrets.ZERO_LOOP_LLM_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          "$GITHUB_WORKSPACE/.zero-loop/plugin/kc-zero-loop-reviewer/bin/zero-loop-reviewer" ci \
+            --payload "$GITHUB_EVENT_PATH" \
+            --provider github \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --config "$RUNNER_TEMP/zero-loop.toml" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --out-dir "$RUNNER_TEMP/zero-loop-out" \
+            --state-dir "$RUNNER_TEMP/zero-loop-state"
+          exit $?

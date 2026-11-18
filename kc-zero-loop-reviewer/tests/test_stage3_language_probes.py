@@ -129,3 +129,43 @@ def test_a_local_go_probe_reaches_go_test_and_fails_behaviourally(tmp_path) -> N
         tree, spec, expected_sha=sha256_hex(content.encode("utf-8")), timeout_s=60
     )
     assert result.status is ProbeStatus.FAIL_BEHAVIORAL, result.stderr[-2000:]
+
+
+def test_a_custom_adapter_runs_a_shell_probe_without_builtin_language_code(tmp_path) -> None:
+    import json
+
+    from zero_loop_reviewer.adapters import adapters_map, parse_adapters
+    from zero_loop_reviewer.config import load_settings
+    from zero_loop_reviewer.stage3.probe import inspect_probe
+
+    raw = json.dumps(
+        {
+            "shell": {
+                "extensions": [".sh"],
+                "test_path": "probe/run.sh",
+                "framework": "shell",
+                "command": ["sh", "{test_path}"],
+                "test_marker": "exit",
+                "assertion_marker": "exit 1",
+            }
+        }
+    )
+    adapters = parse_adapters(raw)
+    settings = load_settings({"probe.adapters": raw}, {})
+    adapter = adapters_map(settings.probe_adapters)["shell"]
+    content = "#!/bin/sh\nif [ 0 -eq 0 ]; then echo failed; exit 1; fi\n"
+    spec = ProbeSpec(test_path="probe/run.sh", content=content, framework="shell")
+    assert inspect_probe(spec, adapter=adapter) == []
+    tree = tmp_path / "shellrepo"
+    (tree / "probe").mkdir(parents=True)
+    (tree / "probe/run.sh").write_text(content, encoding="utf-8")
+    view = SandboxConfigView(
+        runtime="local",
+        work_dir=tmp_path / "work",
+        visible_roots=(),
+        adapters=adapters_map(adapters),
+    )
+    result = LocalSandbox(view).run_probe(
+        tree, spec, expected_sha=sha256_hex(content.encode("utf-8")), timeout_s=30
+    )
+    assert result.status is ProbeStatus.FAIL_BEHAVIORAL, result.stderr[-2000:]

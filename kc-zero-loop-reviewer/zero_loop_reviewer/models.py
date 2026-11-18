@@ -490,7 +490,7 @@ class ProbeSpec(StrictModel):
     test_path: str = Field(min_length=1, max_length=1024)
     content: str = Field(min_length=1, max_length=200_000)
     target_symbols: list[str] = Field(default_factory=list)
-    framework: Literal["pytest", "unittest", "cargo", "go", "node", "tsx"] = "pytest"
+    framework: str = "pytest"
     rationale: str = ""
 
 

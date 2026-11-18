@@ -284,7 +284,7 @@ loopback and put a TLS reverse proxy in front.
 
 `./check.sh` runs everything below. On this machine:
 
-* **458 tests** in about 60–67 s (real git 2.47.3, real Semgrep 1.173.0,
+* **460 tests** in about 60–67 s (real git 2.47.3, real Semgrep 1.173.0,
   real podman 5.4.2, a real OpenAI-compatible HTTP fake for the client tests);
   four podman-image tests skip when no image can run pytest.
 * `python3 eval/run_eval.py` on the annotated corpus: **6/6 buggy cases
@@ -359,6 +359,47 @@ approves with no comments; that is the intended result, not a failure to run.
 Pullfrog and CodeRabbit can comment on a clean YAML diff because they publish
 ungrounded LLM opinions; this reviewer only comments on a mechanically verified
 finding or reports `human_review`.
+
+## Portability: any repository, any language
+
+The review core is repository-agnostic: it reads the base/head diff, the
+project's own entry points and its Semgrep configuration, and it never assumes
+a fixed path such as `web/` or `crates/`. A language only needs an **adapter**
+when you want executable reproduction probes. Built-ins cover Python, Rust, Go,
+JavaScript and TypeScript; any other language is configured with
+`probe.adapters` (JSON):
+
+```toml
+[probe]
+adapters = '''
+{
+  "ruby": {
+    "extensions": [".rb"],
+    "test_path": "test/zl_probe_{name}_test.rb",
+    "framework": "ruby",
+    "image": "docker.io/library/ruby:3.3-alpine",
+    "command": ["ruby", "{test_path}"],
+    "test_marker": "def test_",
+    "assertion_marker": "assert",
+    "syntax_command": ["ruby", "-c", "{path}"]
+  }
+}
+'''
+```
+
+The adapter supplies the test path template, image, command, test/assertion
+markers and optional syntax command. The generated test still has to run in
+the isolated sandbox and fail on the bad commit before it is published. A
+repository with no adapter for a changed language is reviewed statically and
+sent to human review at the probe boundary; the reviewer never invents a
+language command. `sandbox.runtime = local` is development-only and is never a
+CI security boundary.
+
+A minimally language-specific GitHub workflow is in
+`examples/zero-loop-review.yml`; it installs only the Python reviewer runtime
+and pulls the Python probe image, so it can be copied into a Ruby, Java, PHP,
+C#, Elixir or any other repository. Add adapters only if you want executable
+probes for that language.
 
 ## Languages
 
