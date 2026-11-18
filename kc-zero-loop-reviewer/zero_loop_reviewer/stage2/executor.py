@@ -42,7 +42,7 @@ from .secsem import run_security
 DEFAULT_POLICY = Path(__file__).resolve().parents[2] / "rules" / "policy.json"
 
 #: Bounds on how much of the diff is re-read for the CPG/RALE views.
-MAX_SOURCE_FILES = 200
+MAX_SOURCE_FILES = 500
 MAX_SOURCE_BYTES = 400_000
 
 

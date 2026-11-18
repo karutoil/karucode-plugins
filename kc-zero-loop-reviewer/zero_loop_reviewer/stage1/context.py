@@ -913,6 +913,7 @@ def load_conventions(
 #: Unit priority, highest first.  The diff always outranks everything else.
 PRIORITY_FOCUS_DIFF = 100
 PRIORITY_DIFF = 92
+PRIORITY_FUNCTION = 90
 PRIORITY_DELETED_DIFF = 88
 PRIORITY_CRITICAL = 86
 PRIORITY_CONVENTION = 78
@@ -928,6 +929,82 @@ def _cap(text: str, limit: int) -> tuple[str, bool]:
     if limit <= 0 or len(text) <= limit:
         return text, False
     return text[: max(0, limit - 32)] + "\n...[truncated by the reviewer]", True
+
+
+def _enclosing_functions(
+    path: str, source: str, changed_lines: set[int]
+) -> list[tuple[int, int, str]]:
+    """Return deduplicated full function bodies around the changed lines."""
+    lines = source.splitlines()
+    if not lines:
+        return []
+    found: dict[tuple[int, int], str] = {}
+    lower = path.lower()
+    for line_no in sorted(changed_lines):
+        index = max(0, min(len(lines) - 1, line_no - 1))
+        start = end = None
+        if lower.endswith((".py", ".pyi")):
+            start, end = _python_function(lines, index)
+        elif lower.endswith((".rs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".go", ".java", ".kt", ".c", ".h", ".cc", ".cpp", ".hpp", ".cs")):
+            start, end = _brace_function(lines, index)
+        if start is None or end is None or end <= start:
+            continue
+        body = "\n".join(lines[start:end])
+        if len(body) > 25_000:
+            body = body[:25_000] + "\n...[function truncated]"
+        found[(start + 1, end)] = body
+    return [(start, end, body) for (start, end), body in sorted(found.items())]
+
+
+def _python_function(lines: Sequence[str], index: int) -> tuple[int | None, int | None]:
+    definition = re.compile(r"^(\s*)(async\s+)?def\s+\w+")
+    start = None
+    indent = 0
+    for cursor in range(index, -1, -1):
+        match = definition.match(lines[cursor])
+        if match:
+            start = cursor
+            indent = len(match.group(1))
+            break
+    if start is None:
+        return None, None
+    end = len(lines)
+    for cursor in range(start + 1, len(lines)):
+        body = lines[cursor]
+        if not body.strip():
+            continue
+        if len(body) - len(body.lstrip()) <= indent:
+            end = cursor
+            break
+    return start, end
+
+
+def _brace_function(lines: Sequence[str], index: int) -> tuple[int | None, int | None]:
+    definition = re.compile(
+        r"\b(?:fn|function|def|func|public|private|protected|async)\b|\w+\s*\([^;]*\)\s*(?:=>|\{)"
+    )
+    start = None
+    for cursor in range(index, -1, -1):
+        text = lines[cursor]
+        if "{" in text and definition.search(text):
+            start = cursor
+            break
+    if start is None:
+        # The opening brace may be on the following line.
+        for cursor in range(index, -1, -1):
+            if "{" in lines[cursor]:
+                start = max(0, cursor - 1)
+                break
+    if start is None:
+        return None, None
+    depth = 0
+    opened = False
+    for cursor in range(start, len(lines)):
+        depth += lines[cursor].count("{") - lines[cursor].count("}")
+        opened = opened or "{" in lines[cursor]
+        if opened and depth <= 0:
+            return start, cursor + 1
+    return start, len(lines)
 
 
 def _render(unit: ContextUnit) -> str:
@@ -988,6 +1065,28 @@ def build_context(
                 reason="changed file",
             )
         )
+
+    # -- the full enclosing functions of changed lines ---------------------
+    for patch in diff.files:
+        if patch.is_binary or patch.is_deleted or not patch.changed_lines:
+            continue
+        try:
+            source = repo.show(diff.head_sha or "HEAD", patch.path)
+        except Exception:
+            continue
+        for start, end, body in _enclosing_functions(patch.path, source, patch.changed_lines):
+            text, cut = _cap(f"FUNCTION {patch.path}:{start}-{end}\n{body}", 25_000)
+            truncated = truncated or cut
+            units.append(
+                ContextUnit(
+                    kind="function",
+                    source=patch.path,
+                    text=text,
+                    tokens=counter.count(text),
+                    priority=PRIORITY_FUNCTION,
+                    reason="full enclosing function of a changed line",
+                )
+            )
 
     # -- identifiers a reviewer must not skim over -------------------------
     tokens = critical_tokens(diff)

@@ -382,7 +382,7 @@ class SastConfig:
     semgrep_bin: str = "semgrep"
     timeout_s: float = 55.0
     enabled: bool = True
-    max_findings: int = 200
+    max_findings: int = 2000
     trusted_sanitizers: tuple[str, ...] = ("shlex.quote", "html.escape", "escape", "sanitize")
     suppressed_paths: tuple[str, ...] = ("tests/", "test/", "vendor/", "third_party/")
 
@@ -457,6 +457,7 @@ class Settings:
         default_factory=lambda: default_paths(Path.home() / ".local/state/zero-loop-reviewer")
     )
     max_model_tokens: int = 500_000
+    exhaustive: bool = True
     deadline_s: float = 240.0
     stage2_timeout_s: float = 60.0
     probe_attempts: int = 3
@@ -596,6 +597,7 @@ def _merged(settings: Mapping[str, Any], environ: Mapping[str, str], file_values
         "fusion.clip",
         "llm.max_retries",
         "llm.response_format",
+        "review.exhaustive",
         "model.reasoning_effort",
         "model.triage_reasoning_effort",
         "model.security_reasoning_effort",
@@ -796,6 +798,7 @@ def load_settings(
         ci=ci,
         paths=paths,
         max_model_tokens=int(get("review.max_model_tokens", 500_000)),
+        exhaustive=bool(get("review.exhaustive", True)),
         deadline_s=float(get("review.deadline_secs", 240)),
         stage2_timeout_s=float(get("review.stage2_timeout_secs", 60)),
         probe_attempts=max(1, min(3, int(get("review.probe_attempts", 3)))),

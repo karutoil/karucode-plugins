@@ -170,7 +170,7 @@ non-loopback bind without a secret is refused. The secret variable is
 
 `./check.sh` runs everything below. On this machine:
 
-* **438 tests pass** (real git, real Semgrep 1.173.0, real podman 5.4.2,
+* **439 tests pass** (real git, real Semgrep 1.173.0, real podman 5.4.2,
   a real OpenAI-compatible HTTP fake for the client tests).
 * `python3 eval/run_eval.py` on the annotated corpus: **6/6 buggy cases
   intercepted, 0/4 clean or fix-confirming cases flagged**, in ~33 s for all ten cases.
@@ -220,10 +220,20 @@ a test file. Semgrep scans the complete changed-file set in chunks of at most
 capped at 8 each. Only the top 3 verified findings are published.
 
 A 1,000–2,000 line PR usually takes one to three model calls. A 9k-line,
-83-file PR is about 23 calls and can legitimately take 20–40 minutes; the
+83-file PR is about 24 calls and can legitimately take 20–40 minutes; the
 workflow budget is **3600 s** and its job timeout is 75 minutes. The default
 `review.deadline_secs=240` remains for ordinary PRs, so a small PR is still
 reviewed in a few minutes.
+
+Exhaustive mode (`review.exhaustive = true`, the default) also means:
+
+- every production changed line is assigned to a behavioural batch, and a
+  missing assignment is a failed review rather than a silent omission;
+- the full enclosing function of each changed site is added to the context,
+  not just the diff hunk and its 1-hop signatures;
+- an oversized single hunk is split at line boundaries, not dropped;
+- an anchored hypothesis that exceeds the candidate cap is recorded as
+  `behavioral_candidate_coverage_incomplete` and fails open to human review.
 
 Coverage is allowed to be *incomplete*, never silently green. A truncated diff
 or context, a capped batch scan, an oversized production-file hunk, or a
@@ -232,6 +242,13 @@ probe/CIVER cap adds a blind spot; if no finding is verified the verdict is
 committed suggestion. Generated/vendor/lock/doc files and findings inside test
 modules are excluded from publication, but the rule packs still scan their
 changed lines.
+
+This is a **coverage** guarantee, not a recall guarantee. On the 9.6k-line
+PR #17 it covered all **6,492 production changed lines** with zero missing
+assignments and added 725 enclosing-function slices to the context. It still
+cannot promise 99.9% bug recall: the model is probabilistic, verification can
+reject a real but hard-to-reproduce defect, and the public contract caps output
+at three findings.
 
 ## Why a clean diff has no comments
 

@@ -335,6 +335,11 @@ def _summary(
             f"{verdict.suppressed_count}; redacted: {verdict.redacted_count}."
         ),
     ]
+    if verdict.coverage_lines:
+        lines.append(
+            f"Coverage: {verdict.coverage_covered}/{verdict.coverage_lines} "
+            "production changed lines assigned to a behavioural batch."
+        )
 
     published = [finding for finding in findings if not finding.redacted]
     redacted = [finding for finding in findings if finding.redacted]

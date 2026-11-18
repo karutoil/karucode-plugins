@@ -289,7 +289,7 @@ class SymbolView(StrictModel):
 
 
 class ContextUnit(StrictModel):
-    kind: Literal["diff", "signature", "type", "convention", "precedent", "critical_token", "file_head"]
+    kind: Literal["diff", "signature", "type", "function", "convention", "precedent", "critical_token", "file_head"]
     source: str
     text: str
     tokens: int = Field(ge=0)
@@ -741,6 +741,8 @@ class ReviewVerdict(StrictModel):
     gate: GateResult | None = None
     private_log_path: str = ""
     input_sha256: str = ""
+    coverage_lines: int = Field(default=0, ge=0)
+    coverage_covered: int = Field(default=0, ge=0)
     schema_version: int = 1
 
 

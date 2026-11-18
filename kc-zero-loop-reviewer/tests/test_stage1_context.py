@@ -290,3 +290,11 @@ def test_build_context_is_deterministic(tmp_path):
     assert [(u.kind, u.source, u.priority) for u in first.units] == [
         (u.kind, u.source, u.priority) for u in second.units
     ]
+
+
+def test_context_includes_the_full_enclosing_function(tmp_path) -> None:
+    _, repo, diff = _repo_and_diff(tmp_path, "ctx_function")
+    context = build_context(repo, diff, Settings(max_model_tokens=100_000))
+    assert "FUNCTION pkg/a.py:1-2" in context.text
+    assert "def parse(value):" in context.text
+    assert "return eval(value)" in context.text

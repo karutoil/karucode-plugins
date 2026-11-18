@@ -73,9 +73,11 @@ from .stage5 import fusion as fusion_mod
 #: Behavioural LLM calls are bounded so a thousand-line PR is still reviewed in
 #: file-sized batches instead of silently looking at the first file.
 MAX_BEHAVIOR_BATCHES = 24
+EXHAUSTIVE_BEHAVIOR_BATCHES = 100
 MAX_BEHAVIOR_FILES_PER_BATCH = 4
 MAX_BEHAVIOR_BATCH_CHARS = 30_000
 MAX_BEHAVIOR_CANDIDATES = 24
+EXHAUSTIVE_BEHAVIOR_CANDIDATES = 100
 BEHAVIOR_WORKERS = 4
 
 #: Stage 3/4 are expensive and model-backed; the top candidates get the budget,
@@ -146,6 +148,8 @@ class _Run:
     diff: DiffBundle | None = None
     context: ContextSlice | None = None
     stage2: Stage2Outcome | None = None
+    coverage_total: int = 0
+    coverage_covered: int = 0
 
 
 class Reviewer:
@@ -495,6 +499,8 @@ class Reviewer:
                     "stage 2 ",
                     "behavioral_scan_degraded",
                     "behavioral_coverage_incomplete",
+                    "behavioral_candidate_coverage_incomplete",
+                    "behavioral_hunk_coverage_incomplete",
                     "probe_coverage_incomplete",
                     "civer_coverage_incomplete",
                     "context_truncated",
@@ -534,13 +540,26 @@ class Reviewer:
         """
         if budget.remaining() < 20.0:
             return []
-        batches, capped_batches, oversized = _behavioral_batches(diff)
+        batches, capped_batches, oversized = _behavioral_batches(
+            diff,
+            max_batches=(
+                EXHAUSTIVE_BEHAVIOR_BATCHES
+                if self.settings.exhaustive
+                else MAX_BEHAVIOR_BATCHES
+            ),
+        )
         if not batches:
             return []
+        max_candidates = (
+            EXHAUSTIVE_BEHAVIOR_CANDIDATES
+            if self.settings.exhaustive
+            else MAX_BEHAVIOR_CANDIDATES
+        )
         started = _now()
         kept: list[Candidate] = []
         seen: set[str] = set()
         rejected = 0
+        over_cap = 0
         failed = 0
         # A huge PR can spend an hour, but a 4-minute review must not start 17
         # five-minute calls.  Batches run four at a time, so budget in waves:
@@ -600,8 +619,8 @@ class Reviewer:
                     if not sites:
                         rejected += 1
                         continue
-                    if len(kept) >= MAX_BEHAVIOR_CANDIDATES:
-                        rejected += 1
+                    if len(kept) >= max_candidates:
+                        over_cap += 1
                         continue
                     trigger = f" Trigger: {draft.suspected_trigger}" if draft.suspected_trigger else ""
                     candidate = Candidate(
@@ -636,7 +655,30 @@ class Reviewer:
             f"{len(kept)} hypotheses from {len(batches)} batch(es), {rejected} rejected, {failed} batch failure(s)",
         )
         if rejected:
-            run.degraded.append(f"behavioral_scan_filtered: {rejected} hypothesis(es) were unanchored or over the cap")
+            run.degraded.append(f"behavioral_scan_filtered: {rejected} hypothesis(es) were unanchored")
+        if over_cap:
+            run.degraded.append(
+                f"behavioral_candidate_coverage_incomplete: {over_cap} anchored hypothesis(es) exceeded the candidate cap"
+            )
+        required = {
+            (patch.path, line)
+            for patch in diff.files
+            if _behavioral_eligible(patch) and not _is_test_path(patch.path)
+            for line in patch.changed_lines
+        }
+        covered = {
+            (patch.path, line)
+            for batch in batches
+            for patch in batch
+            for line in patch.changed_lines
+        }
+        missing = required - covered
+        run.coverage_total = len(required)
+        run.coverage_covered = len(required & covered)
+        if missing:
+            run.degraded.append(
+                f"behavioral_hunk_coverage_incomplete: {len(missing)} production hunk(s) were not assigned to a batch"
+            )
         if capped_batches:
             run.degraded.append(
                 f"behavioral_coverage_incomplete: only {len(batches)} of the ranked file batches fit the review budget"
@@ -1353,6 +1395,8 @@ class Reviewer:
             gate=gate,
             private_log_path=private_log_path,
             input_sha256=run.context.input_sha256 if run.context is not None else "",
+            coverage_lines=run.coverage_total,
+            coverage_covered=run.coverage_covered,
         )
 
 
@@ -1518,24 +1562,86 @@ def _is_test_path(path: str) -> bool:
     )
 
 
+def _split_hunk(hunk) -> tuple[list, bool]:
+    """Split one oversized hunk into line-numbered pieces for evidence."""
+    size = len(hunk.header) + sum(len(line) + 1 for line in hunk.lines)
+    if size <= MAX_BEHAVIOR_BATCH_CHARS:
+        return [hunk], False
+    pieces = []
+    current: list[str] = []
+    chars = 0
+    old_start = hunk.old_start
+    new_start = hunk.new_start
+    old_count = 0
+    new_count = 0
+    old_cursor = old_start
+    new_cursor = new_start
+
+    def flush() -> None:
+        nonlocal current, chars, old_start, new_start, old_count, new_count
+        if not current:
+            return
+        pieces.append(
+            hunk.model_copy(
+                update={
+                    "old_start": old_start,
+                    "old_lines": old_count,
+                    "new_start": new_start,
+                    "new_lines": new_count,
+                    "header": f"@@ -{old_start},{old_count} +{new_start},{new_count} @@",
+                    "lines": list(current),
+                }
+            )
+        )
+        current = []
+        chars = 0
+        old_start = old_cursor
+        new_start = new_cursor
+        old_count = 0
+        new_count = 0
+
+    for raw in hunk.lines:
+        if current and chars + len(raw) + 1 > MAX_BEHAVIOR_BATCH_CHARS:
+            flush()
+        current.append(raw)
+        chars += len(raw) + 1
+        if raw.startswith("+") and not raw.startswith("+++"):
+            new_cursor += 1
+            new_count += 1
+        elif raw.startswith("-") and not raw.startswith("---"):
+            old_cursor += 1
+            old_count += 1
+        elif raw.startswith("\\"):
+            pass
+        else:
+            old_cursor += 1
+            new_cursor += 1
+            old_count += 1
+            new_count += 1
+    flush()
+    return pieces, False
+
+
 def _split_large_patch(patch: FilePatch) -> tuple[list[FilePatch], bool]:
     """Split a large file diff at hunk boundaries for behavioural batches."""
-    hunks = list(patch.hunks)
-    if not hunks:
+    pieces = []
+    unsplittable = False
+    for hunk in patch.hunks:
+        split, bad = _split_hunk(hunk)
+        pieces.extend(split)
+        unsplittable = unsplittable or bad
+    if not pieces:
         return [patch], True
     chunks: list[list] = []
     current: list = []
     chars = 0
-    unsplittable = False
-    for hunk in hunks:
-        size = len(hunk.header) + sum(len(line) + 1 for line in hunk.lines)
-        if size > MAX_BEHAVIOR_BATCH_CHARS:
-            unsplittable = True
+    for piece in pieces:
+        size = len(piece.header) + sum(len(line) + 1 for line in piece.lines)
         if current and chars + size > MAX_BEHAVIOR_BATCH_CHARS:
             chunks.append(current)
             current = []
             chars = 0
-        current.append(hunk)
+        current.append(piece)
         chars += size
     if current:
         chunks.append(current)
@@ -1554,8 +1660,14 @@ def _split_large_patch(patch: FilePatch) -> tuple[list[FilePatch], bool]:
     )
 
 
+def _hunk_key(path: str, hunk) -> str:
+    return f"{path}:{hunk.old_start}:{hunk.new_start}:{hunk.header}"
+
+
 def _behavioral_batches(
     diff: DiffBundle,
+    *,
+    max_batches: int = MAX_BEHAVIOR_BATCHES,
 ) -> tuple[list[list[FilePatch]], bool, bool]:
     """Rank changed source files and group them into evidence-sized batches."""
     files = sorted(
@@ -1593,18 +1705,18 @@ def _behavioral_batches(
         chars += size
     if current:
         batches.append(current)
-    capped = len(batches) > MAX_BEHAVIOR_BATCHES
-    return batches[:MAX_BEHAVIOR_BATCHES], capped, oversized
+    capped = len(batches) > max_batches
+    return batches[:max_batches], capped, oversized
 
 
 def _context_for_batch(context: ContextSlice, paths: set[str]) -> ContextSlice:
     selected = [
         unit
         for unit in context.units
-        if unit.kind != "diff" or unit.source in paths
+        if unit.kind not in ("diff", "function") or unit.source in paths
     ]
     text = "\n\n".join(unit.text for unit in selected) or context.text
-    text = text[: MAX_BEHAVIOR_BATCH_CHARS * 2]
+    text = text[: MAX_BEHAVIOR_BATCH_CHARS * 4]
     return context.model_copy(update={"text": text, "tokens": max(1, len(text) // 4)})
 
 
