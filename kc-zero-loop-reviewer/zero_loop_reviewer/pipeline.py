@@ -804,31 +804,43 @@ class Reviewer:
             ),
             deadline_s=max(5.0, budget.remaining()),
         )
-        for candidate in sorted(candidates, key=lambda c: (-_severity(c.severity), c.id)):
+        ordered = sorted(candidates, key=lambda c: (-_severity(c.severity), c.id))
+        pending: list[tuple[int, Candidate]] = []
+        updates: dict[int, list[Candidate]] = {}
+
+        def record_skip(index: int, candidate: Candidate, reason: str = "") -> None:
+            updates[index] = [candidate]
+            if reason:
+                self._record("3.probe", AttemptStatus.SKIPPED, _now(), f"{candidate.id}: {reason}")
+
+        for index, candidate in enumerate(ordered):
             if candidate.status is FindingStatus.SUPPRESSED:
-                updated.append(candidate)
+                record_skip(index, candidate)
                 continue
             self._cap_llm(budget)
             if not ok or budget.remaining() < 20.0:
                 updated.append(candidate)
                 run.degraded.append("probe_coverage_incomplete: the deadline ended probe synthesis")
+                updates[index] = [candidate]
                 continue
             if not _probe_supported(candidate, self.settings.probe_adapters):
-                updated.append(candidate)
-                self._record(
-                    "3.probe",
-                    AttemptStatus.SKIPPED,
-                    _now(),
-                    f"{candidate.id}: no probe framework for {candidate.cited_sites[0].path if candidate.cited_sites else 'the cited site'}",
+                record_skip(
+                    index,
+                    candidate,
+                    f"no probe framework for {candidate.cited_sites[0].path if candidate.cited_sites else 'the cited site'}",
                 )
                 continue
             if probed >= MAX_PROBED_CANDIDATES:
-                updated.append(candidate)
+                updates[index] = [candidate]
                 run.degraded.append(
                     f"probe_coverage_incomplete: only the first {MAX_PROBED_CANDIDATES} candidates were probed"
                 )
                 continue
             probed += 1
+            pending.append((index, candidate))
+
+        def probe_candidate(item: tuple[int, Candidate]):
+            index, candidate = item
             started = _now()
             try:
                 result, new_pairs, degraded = cascade_mod.run_cascade(
@@ -841,37 +853,59 @@ class Reviewer:
                     stage_settings,
                     healthz=lambda: not budget.expired(),
                 )
-                updated.extend(result)
-                pairs.extend(new_pairs)
-                run.degraded.extend(degraded)
-                status = AttemptStatus.COMPLETED if new_pairs else AttemptStatus.SKIPPED
-                pair = new_pairs[-1] if new_pairs else None
-                self._record(
-                    "3.probe",
-                    status,
+                return index, candidate, result, new_pairs, degraded, started, ""
+            except Exception as exc:  # one broken candidate must not stop the rest
+                return (
+                    index,
+                    candidate,
+                    [candidate],
+                    [],
+                    [],
                     started,
-                    (
-                        f"{candidate.id}: base={pair.base.status.value} head={pair.head.status.value} "
-                        f"-> {pair.classification.value}"
-                        if pair
-                        else f"{candidate.id}: no probe pair"
-                    ),
+                    f"{type(exc).__name__}: {exc}",
                 )
-                if pair is not None:
-                    for side in (pair.base, pair.head):
-                        if side.input_sha256:
-                            self._record(
-                                "3.sandbox",
-                                AttemptStatus.COMPLETED if side.mechanical else AttemptStatus.SANDBOX_UNAVAILABLE,
-                                started,
-                                f"{side.status.value} exit={side.exit_code} image={side.container_image}",
-                                exit_code=side.exit_code,
-                                input_sha256=side.input_sha256,
-                            )
-            except Exception as exc:
-                run.degraded.append(f"cascade_failed: {candidate.id}: {type(exc).__name__}: {exc}")
-                self._record("3.probe", AttemptStatus.PROCESS_CRASH, started, str(exc))
-                updated.append(candidate)
+
+        workers = max(1, min(int(getattr(self.settings, "probe_workers", 1) or 1), len(pending) or 1))
+        if pending:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(probe_candidate, item) for item in pending]
+                for future in as_completed(futures):
+                    index, candidate, result, new_pairs, degraded, started, failure = future.result()
+                    updates[index] = result
+                    run.degraded.extend(degraded)
+                    pairs.extend(new_pairs)
+                    if failure:
+                        run.degraded.append(f"cascade_failed: {candidate.id}: {failure}")
+                        self._record("3.probe", AttemptStatus.PROCESS_CRASH, started, failure)
+                        continue
+                    status = AttemptStatus.COMPLETED if new_pairs else AttemptStatus.SKIPPED
+                    pair = new_pairs[-1] if new_pairs else None
+                    self._record(
+                        "3.probe",
+                        status,
+                        started,
+                        (
+                            f"{candidate.id}: base={pair.base.status.value} head={pair.head.status.value} "
+                            f"-> {pair.classification.value}"
+                            if pair
+                            else f"{candidate.id}: no probe pair"
+                        ),
+                    )
+                    if pair is not None:
+                        for side in (pair.base, pair.head):
+                            if side.input_sha256:
+                                self._record(
+                                    "3.sandbox",
+                                    AttemptStatus.COMPLETED if side.mechanical else AttemptStatus.SANDBOX_UNAVAILABLE,
+                                    started,
+                                    f"{side.status.value} exit={side.exit_code} image={side.container_image}",
+                                    exit_code=side.exit_code,
+                                    input_sha256=side.input_sha256,
+                                )
+        for index, candidate in enumerate(ordered):
+            if index not in updates:
+                updates[index] = [candidate]
+        updated = [item for index in range(len(ordered)) for item in updates.get(index, [ordered[index]])]
 
         # Stage 3C: grounded 5-vote fallback for anything still unverified.
         for candidate in list(updated):

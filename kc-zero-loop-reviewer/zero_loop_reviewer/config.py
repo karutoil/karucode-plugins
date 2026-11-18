@@ -467,6 +467,7 @@ class Settings:
     deadline_s: float = 240.0
     stage2_timeout_s: float = 60.0
     probe_attempts: int = 3
+    probe_workers: int = 1
     probe_adapters: tuple[ProbeAdapter, ...] = BUILTIN_ADAPTERS
     max_findings: int = 0
     designlore_files: tuple[str, ...] = (
@@ -622,6 +623,7 @@ def _merged(settings: Mapping[str, Any], environ: Mapping[str, str], file_values
         "review.decomposition",
         "model.monitor_alt",
         "probe.adapters",
+        "review.probe_workers",
         "model.reasoning_effort",
         "model.triage_reasoning_effort",
         "model.security_reasoning_effort",
@@ -837,6 +839,7 @@ def load_settings(
         deadline_s=float(get("review.deadline_secs", 240)),
         stage2_timeout_s=float(get("review.stage2_timeout_secs", 60)),
         probe_attempts=max(1, min(3, int(get("review.probe_attempts", 3)))),
+        probe_workers=max(1, min(8, int(get("review.probe_workers", 1)))),
         max_findings=max(0, min(50, int(get("review.max_findings", 0)))),
         probe_adapters=adapters,
     )

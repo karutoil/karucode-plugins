@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -62,6 +63,9 @@ def _ok(cwd: Path, args: Sequence[str], *, timeout: float = 60.0) -> str:
 class GitRepo:
     def __init__(self, root: Path):
         self.root = Path(root).resolve()
+        # Candidate probes run concurrently; worktree add/remove mutate the
+        # shared .git/worktrees directory.
+        self._worktree_lock = threading.RLock()
 
     # -- identity ---------------------------------------------------------
     def is_repo(self) -> bool:
@@ -136,12 +140,14 @@ class GitRepo:
         dest.parent.mkdir(parents=True, exist_ok=True)
         if dest.exists():
             raise GitError(f"worktree destination already exists: {dest}")
-        _ok(self.root, ["worktree", "add", "--detach", str(dest), sha], timeout=180)
+        with self._worktree_lock:
+            _ok(self.root, ["worktree", "add", "--detach", str(dest), sha], timeout=180)
         return dest
 
     def remove_worktree(self, dest: Path) -> None:
-        _run(self.root, ["worktree", "remove", "--force", str(dest)], timeout=120)
-        _run(self.root, ["worktree", "prune"])
+        with self._worktree_lock:
+            _run(self.root, ["worktree", "remove", "--force", str(dest)], timeout=120)
+            _run(self.root, ["worktree", "prune"])
 
     def worktree_for(self, sha: str, dest: Path) -> Path:
         return self.add_worktree(sha, dest)
