@@ -543,9 +543,12 @@ class Reviewer:
         rejected = 0
         failed = 0
         # A huge PR can spend an hour, but a 4-minute review must not start 17
-        # five-minute calls.  One batch is budgeted at ~2 minutes of wall time;
-        # the rest are a declared blind spot, not a silent omission.
-        allowed = min(len(batches), max(1, int(budget.remaining() / 120)))
+        # five-minute calls.  Batches run four at a time, so budget in waves:
+        # two minutes per wave, four batches per wave.  The rest are a declared
+        # blind spot, not a silent omission.
+        workers = min(BEHAVIOR_WORKERS, len(batches))
+        waves = max(1, int(budget.remaining() / 120))
+        allowed = min(len(batches), waves * workers)
         if allowed < len(batches):
             capped_batches = True
             batches = batches[:allowed]
@@ -562,7 +565,6 @@ class Reviewer:
             )
             return index, list(answer.value.candidates)
 
-        workers = min(BEHAVIOR_WORKERS, len(batches))
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
                 pool.submit(run_batch, index, batch): (index, batch)
