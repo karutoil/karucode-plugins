@@ -42,7 +42,7 @@ can resume without re-reading the transcript.
 ## Phase 5 — Stage 5 (done)
 - [x] policy-free risk elicitation + leakage test (schema descriptions stripped, word-boundary matcher)
 - [x] monitor ensemble + deterministic fusion + coded Bayes τ
-- [x] top-3 cap, one-click suggestion (post-image hunk), diff fallback for multi-hunk
+- [x] configurable publication cap, one-click suggestion (post-image hunk), diff fallback for multi-hunk
 - [x] AFCRA redaction, 0600 private record with verified patch, public gate status only
 
 ## Phase 6 — end to end (done)

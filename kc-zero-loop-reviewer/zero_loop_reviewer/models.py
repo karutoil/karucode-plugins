@@ -730,7 +730,7 @@ class ReviewVerdict(StrictModel):
     decision: Decision
     p_combined: float = Field(default=0.0, ge=0.0, le=1.0)
     tau: float = Field(gt=0.0, lt=1.0)
-    findings: list[Finding] = Field(default_factory=list, max_length=3)
+    findings: list[Finding] = Field(default_factory=list, max_length=50)
     suppressed_count: int = Field(default=0, ge=0)
     redacted_count: int = Field(default=0, ge=0)
     receipts: list[Receipt] = Field(default_factory=list)

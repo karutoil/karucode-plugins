@@ -1,4 +1,4 @@
-"""Stage 5D: top-3 cap, verified suggestions only, one consolidated review."""
+"""Stage 5D: publication cap, verified suggestions only, one consolidated review."""
 
 from __future__ import annotations
 
@@ -129,7 +129,7 @@ def _verdict(findings: list[Finding], *, decision: Decision = Decision.REQUEST_C
 # --------------------------------------------------------------------------- #
 
 
-def test_select_caps_at_three_and_ranks_by_severity_then_probability() -> None:
+def test_select_ranks_by_severity_then_probability() -> None:
     candidates = [
         _candidate("low-probable", severity=1, p=0.95),
         _candidate("high-low-probability", severity=3, p=0.55),
@@ -137,13 +137,19 @@ def test_select_caps_at_three_and_ranks_by_severity_then_probability() -> None:
         _candidate("medium", severity=2, p=0.99),
         _candidate("cosmetic", severity=0, p=1.0),
     ]
-    assert [c.id for c in select(candidates, 5)] == ["high-probable", "high-low-probability", "medium"]
-    assert MAX_FINDINGS == 3
+    assert [c.id for c in select(candidates, 5)] == [
+        "high-probable",
+        "high-low-probability",
+        "medium",
+        "low-probable",
+        "cosmetic",
+    ]
+    assert MAX_FINDINGS == 50
 
 
-def test_select_cannot_be_asked_for_more_than_three() -> None:
-    candidates = [_candidate(f"c-{index}") for index in range(5)]
-    assert len(select(candidates, 10)) == 3
+def test_select_cannot_be_asked_for_more_than_fifty() -> None:
+    candidates = [_candidate(f"c-{index}") for index in range(55)]
+    assert len(select(candidates, 100)) == 50
     assert len(select(candidates, 0)) == 0
 
 
@@ -176,11 +182,11 @@ def test_a_redacted_security_flag_needs_no_fix() -> None:
 
 
 def test_the_cap_overflow_is_suppressed_with_a_receipt() -> None:
-    candidates = [_candidate(f"c-{index}", severity=index % 4) for index in range(5)]
-    published, suppressed = select_with_receipts(candidates, 5)
-    assert len(published) == 3
-    assert len(suppressed) == 2
-    assert all("top-3 cap" in candidate.suppression_reason for candidate in suppressed)
+    candidates = [_candidate(f"c-{index}", severity=index % 4) for index in range(55)]
+    published, suppressed = select_with_receipts(candidates, 55)
+    assert len(published) == 50
+    assert len(suppressed) == 5
+    assert all("publication cap" in candidate.suppression_reason for candidate in suppressed)
     assert all(candidate.status is FindingStatus.SUPPRESSED for candidate in suppressed)
 
 

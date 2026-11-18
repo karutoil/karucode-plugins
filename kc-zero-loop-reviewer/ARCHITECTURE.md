@@ -147,7 +147,7 @@ git provider / CI job / karucode tool call
                 │
                 ▼
  stage 5  risk-only elicitation p ── independent monitor S (k=5, T=0.8)
-          coded Bayes τ = C_FR/(C_FA+C_FR) ── top-3 cap ── one-click suggestion
+          coded Bayes τ = C_FR/(C_FA+C_FR) ── configurable publication cap ── one-click suggestion
           tiered security redaction
                 │
                 ▼

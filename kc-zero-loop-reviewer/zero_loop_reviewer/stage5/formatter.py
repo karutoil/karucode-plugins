@@ -1,4 +1,4 @@
-"""Stage 5 — one review payload, top-3 cap, verified suggestions only.
+"""Stage 5 — one review payload, configurable cap, verified suggestions only.
 
 A finding is published only when it is verified **and** either carries a
 CIVER-verified fix or is a redacted security flag.  Anything else is dropped
@@ -6,8 +6,9 @@ with a receipt-able reason (``status=SUPPRESSED`` +
 ``suppression_reason``), never silently.
 
 The output is exactly one provider review: a summary body that states the
-decision and every degraded mode, plus at most three inline comments at cited
-lines.  No threads, no author text, no per-comment conversation.
+decision and every degraded mode, plus up to the configured number of inline
+comments at cited lines.  No threads, no author text, no per-comment
+conversation.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ from ..providers.base import ReviewComment, ReviewPayload
 from .redaction import public_body
 
 #: A review never shows more than this many findings, whatever the caller asks.
-MAX_FINDINGS = 3
+MAX_FINDINGS = 50
 
 #: Per-comment body ceiling, independent of the review body ceiling.
 MAX_COMMENT_CHARS = 12_000
@@ -109,7 +110,7 @@ def select_with_receipts(
                 update={
                     "status": FindingStatus.SUPPRESSED,
                     "suppression_reason": (
-                        f"top-{cap} cap: ranked below {cap} higher-severity or higher-probability findings"
+                        f"publication cap ({cap}): ranked below higher-severity or higher-probability findings"
                     ),
                 }
             )
