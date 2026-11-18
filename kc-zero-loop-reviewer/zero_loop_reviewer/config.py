@@ -107,9 +107,9 @@ SETTING_DECLARATIONS: list[dict[str, Any]] = [
         "label": "Review deadline (s)",
         "type": "number",
         "default": 240,
-        "help": "1–4 minute CI budget. Later stages degrade to human review rather than overrun silently.",
+        "help": "Typical 1–4 minute budget; raise to 3600 for a huge PR. Later stages degrade to human review rather than overrun silently.",
         "min": 30,
-        "max": 1800,
+        "max": 3600,
     },
     {
         "key": "review.stage2_timeout_secs",
@@ -124,8 +124,8 @@ SETTING_DECLARATIONS: list[dict[str, Any]] = [
         "key": "review.max_model_tokens",
         "label": "Context token budget",
         "type": "number",
-        "default": 128000,
-        "help": "Hard ceiling for the compressed context slice.",
+        "default": 500000,
+        "help": "Hard ceiling for the compressed context slice (default 500k tokens).",
         "min": 4000,
         "max": 1048576,
     },
@@ -325,7 +325,7 @@ DEFAULT_MODEL = "od/deepseek-v4.1-flash"
 class StageModel:
     model: str
     temperature: float | None = None
-    max_tokens: int = 4096
+    max_tokens: int = 65_536
     votes: int = 1
     reasoning_effort: str | None = None
 
@@ -456,7 +456,7 @@ class Settings:
     paths: PathConfig = field(
         default_factory=lambda: default_paths(Path.home() / ".local/state/zero-loop-reviewer")
     )
-    max_model_tokens: int = 128_000
+    max_model_tokens: int = 500_000
     deadline_s: float = 240.0
     stage2_timeout_s: float = 60.0
     probe_attempts: int = 3
@@ -597,6 +597,12 @@ def _merged(settings: Mapping[str, Any], environ: Mapping[str, str], file_values
         "llm.max_retries",
         "llm.response_format",
         "model.reasoning_effort",
+        "model.triage_reasoning_effort",
+        "model.security_reasoning_effort",
+        "model.probe_reasoning_effort",
+        "model.reviewer_reasoning_effort",
+        "model.monitor_reasoning_effort",
+        "model.max_tokens",
         "sast.enabled",
         "sast.semgrep_bin",
         "sast.timeout_secs",
@@ -654,11 +660,40 @@ def load_settings(
     # budget thinking unless the effort is bounded.  "low" keeps DeepSeek
     # V4.1-Flash's answer shape stable and its latency under a few seconds;
     # operators can raise it in TOML/env without a code change.
-    effort_raw = str(get("model.reasoning_effort", "low") or "").strip().lower()
-    reasoning_effort = effort_raw if effort_raw in ("none", "minimal", "low", "medium", "high") else None
-    primary = StageModel(model=primary_model, temperature=0.0, reasoning_effort=reasoning_effort)
+    allowed_effort = ("none", "minimal", "low", "medium", "high")
+
+    def effort(key: str, fallback: str) -> str:
+        raw = str(get(key, fallback) or fallback).strip().lower()
+        return raw if raw in allowed_effort else fallback
+
+    # Code review spends reasoning where judgement matters: security and the
+    # primary/reviewer path run high, triage stays cheap, and test synthesis is
+    # medium.  Operators can override every stage in TOML/env.
+    reasoning_effort = effort("model.reasoning_effort", "high")
+    triage_effort = effort("model.triage_reasoning_effort", "low")
+    security_effort = effort("model.security_reasoning_effort", "high")
+    probe_effort = effort("model.probe_reasoning_effort", "medium")
+    reviewer_effort = effort("model.reviewer_reasoning_effort", "high")
+    monitor_effort = effort("model.monitor_reasoning_effort", "medium")
+    output_tokens = int(get("model.max_tokens", 65_536))
+    if not 256 <= output_tokens <= 1_000_000:
+        raise SettingError("model.max_tokens must lie between 256 and 1000000")
+    primary = StageModel(
+        model=primary_model,
+        temperature=0.0,
+        max_tokens=output_tokens,
+        reasoning_effort=reviewer_effort,
+    )
     monitor_votes = int(get("fusion.monitor_votes", 5))
     monitor_temp = float(get("fusion.monitor_temperature", 0.8))
+
+    def stage_model(model_key: str, temperature: float, stage_effort: str) -> StageModel:
+        return StageModel(
+            model=str(get(model_key) or primary_model),
+            temperature=temperature,
+            max_tokens=output_tokens,
+            reasoning_effort=stage_effort,
+        )
 
     llm = LLMConfig(
         base_url=str(get("llm.base_url", "") or ""),
@@ -667,22 +702,24 @@ def load_settings(
         max_retries=int(get("llm.max_retries", 2)),
         response_format=bool(get("llm.response_format", True)),
         primary=primary,
-        triage=StageModel(model=str(get("model.triage") or primary_model), temperature=0.0, reasoning_effort=reasoning_effort),
-        security=StageModel(model=str(get("model.security") or primary_model), temperature=0.0, reasoning_effort=reasoning_effort),
-        probe=StageModel(model=str(get("model.probe") or primary_model), temperature=0.2, reasoning_effort=reasoning_effort),
-        reviewer=StageModel(model=str(get("model.reviewer") or primary_model), temperature=0.0, reasoning_effort=reasoning_effort),
+        triage=stage_model("model.triage", 0.0, triage_effort),
+        security=stage_model("model.security", 0.0, security_effort),
+        probe=stage_model("model.probe", 0.2, probe_effort),
+        reviewer=stage_model("model.reviewer", 0.0, reviewer_effort),
         monitor=StageModel(
             model=str(get("model.monitor") or primary_model),
             temperature=monitor_temp,
             votes=monitor_votes,
-            reasoning_effort=reasoning_effort,
+            max_tokens=output_tokens,
+            reasoning_effort=monitor_effort,
         ),
         monitor_alt=(
             StageModel(
                 model=str(get("model.monitor_alt")),
                 temperature=monitor_temp,
                 votes=monitor_votes,
-                reasoning_effort=reasoning_effort,
+                max_tokens=output_tokens,
+                reasoning_effort=monitor_effort,
             )
             if get("model.monitor_alt")
             else None
@@ -758,7 +795,7 @@ def load_settings(
         redaction=redaction,
         ci=ci,
         paths=paths,
-        max_model_tokens=int(get("review.max_model_tokens", 128_000)),
+        max_model_tokens=int(get("review.max_model_tokens", 500_000)),
         deadline_s=float(get("review.deadline_secs", 240)),
         stage2_timeout_s=float(get("review.stage2_timeout_secs", 60)),
         probe_attempts=max(1, min(3, int(get("review.probe_attempts", 3)))),

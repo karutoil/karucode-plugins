@@ -108,10 +108,10 @@ def triage_prompt(
 ) -> Prompt:
     user = _join(
         _schema("TriagePlan", TriagePlan),
-        _evidence("diff_stat", _diff_digest(diff), 8000),
+        _evidence("diff_stat", _diff_digest(diff), 24000),
         _evidence("changed_symbols", list(changed_symbols)[:60], 4000),
         _evidence("critical_tokens", list(critical_tokens)[:80], 4000),
-        _evidence("one_hop_context", context.text if context else "", 8000),
+        _evidence("one_hop_context", context.text if context else "", 24000),
         "Task: choose the smallest set of files/functions this review must inspect, and name the "
         "symbols whose callers or definitions must be retrieved (at most 12). Then list concrete "
         "risk hypotheses that a test could falsify. Do not decide whether to approve or reject.",
@@ -146,8 +146,8 @@ def security_prompt(
     ]
     user = _join(
         _schema("SecSemScan", SecSemScan),
-        _evidence("changed_code", _diff_digest(diff), 14000),
-        _evidence("one_hop_context", context.text, 10000),
+        _evidence("changed_code", _diff_digest(diff), 80000),
+        _evidence("one_hop_context", context.text, 60000),
         _evidence("analyzer_trace", analyzer_view, 8000),
         _evidence("cpg_frames", [f.model_dump(mode="json") for f in frames[:12]], 10000),
         _evidence("rule_metadata", list(rules)[:40], 4000),
@@ -211,8 +211,8 @@ def behavioral_prompt(
 ) -> Prompt:
     user = _join(
         _schema("BehavioralCandidates", BehavioralCandidates),
-        _evidence("changed_code", _diff_digest(diff), 16000),
-        _evidence("one_hop_context", context.text, 16000),
+        _evidence("changed_code", _diff_digest(diff), 120000),
+        _evidence("one_hop_context", context.text, 120000),
         _evidence("risk_hypotheses", plan.risk_hypotheses if plan else [], 4000),
         """Task: name at most three behavioural defects a reproduction test could demonstrate in the CHANGED lines.
 Look for: wrong boundary arithmetic, missing None/empty handling, an error path that skips cleanup, a state transition left inconsistent, a changed return contract its callers cannot satisfy, a guard that no longer covers a new branch.

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from functools import lru_cache
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -73,65 +74,75 @@ def run_semgrep(
     except ToolError as exc:
         return SastOutcome(status=AttemptStatus.TOOL_UNAVAILABLE, detail=str(exc))
     timeout_s = max(1.0, float(config.timeout_s))
-    argv = [
-        config.semgrep_bin,
-        "scan",
-        "--json",
-        "--metrics=off",
-        "--disable-version-check",
-        "--quiet",
-        "--timeout",
-        str(max(1, int(timeout_s))),
-        "--config",
-        rules,
-        # Scan the changed files themselves.  Passing "." made Semgrep walk the
-        # whole repository before applying --include, which is minutes on a
-        # monorepo and defeats the CI budget.
-        *targets,
-    ]
-    parsed: dict[str, Any] = {}
+    results: list[dict[str, Any]] = []
+    errors: list[Any] = []
+    raw_parts: list[str] = []
+    chunks = _target_chunks(targets)
+    # Divide the analyzer budget across chunks; one slow chunk must not consume
+    # the whole Stage 2 window and starve the other changed files.
+    chunk_timeout = max(5.0, timeout_s / max(1, len(chunks)))
+    for index, chunk in enumerate(chunks, 1):
+        argv = [
+            config.semgrep_bin,
+            "scan",
+            "--json",
+            "--metrics=off",
+            "--disable-version-check",
+            "--quiet",
+            "--timeout",
+            str(max(1, int(chunk_timeout))),
+            "--config",
+            rules,
+            # Scan the changed files themselves.  Passing "." made Semgrep walk
+            # the whole repository before applying --include, which is minutes
+            # on a monorepo and defeats the CI budget.
+            *chunk,
+        ]
+        parsed: dict[str, Any] = {}
 
-    def _check(text: str) -> tuple[bool, str]:
+        def _check(text: str) -> tuple[bool, str]:
+            try:
+                doc = json.loads(text)
+            except ValueError as exc:
+                return False, f"semgrep output is not JSON: {exc}"
+            if not isinstance(doc, dict) or not isinstance(doc.get("results"), list):
+                return False, "semgrep JSON has no results array"
+            parsed.update(doc)
+            return True, ""
+
         try:
-            doc = json.loads(text)
-        except ValueError as exc:
-            return False, f"semgrep output is not JSON: {exc}"
-        if not isinstance(doc, dict) or not isinstance(doc.get("results"), list):
-            return False, "semgrep JSON has no results array"
-        parsed.update(doc)
-        return True, ""
-
-    try:
-        run = run_bounded(
-            argv,
-            cwd=root,
-            timeout_s=timeout_s,
-            env=_child_env(environ),
-            schema_check=_check,
-            read_only_root=root,
-            read_only_paths=targets,
-        )
-    except FileNotFoundError:
-        return SastOutcome(
-            status=AttemptStatus.TOOL_UNAVAILABLE,
-            detail=f"semgrep binary {config.semgrep_bin!r} is not installed",
-        )
-    except OSError as exc:
-        return SastOutcome(
-            status=AttemptStatus.PROCESS_CRASH,
-            detail=f"could not start semgrep: {exc}",
-        )
-    raw_sha256 = sha256_hex(run.stdout)
-    if run.status is not AttemptStatus.COMPLETED:
-        return SastOutcome(
-            status=run.status,
-            detail=_failure_detail(run.exit_code, run.stderr, parsed),
-            raw_sha256=raw_sha256,
-        )
-    findings = _findings(parsed, root, config.max_findings)
-    detail = f"semgrep {run.exit_code}: {len(findings)} finding(s) on {len(targets)} changed file(s)"
-    errors = parsed.get("errors")
-    if isinstance(errors, list) and errors:
+            run = run_bounded(
+                argv,
+                cwd=root,
+                timeout_s=chunk_timeout,
+                env=_child_env(environ),
+                schema_check=_check,
+                read_only_root=root,
+                read_only_paths=chunk,
+            )
+        except FileNotFoundError:
+            return SastOutcome(
+                status=AttemptStatus.TOOL_UNAVAILABLE,
+                detail=f"semgrep binary {config.semgrep_bin!r} is not installed",
+            )
+        except OSError as exc:
+            return SastOutcome(
+                status=AttemptStatus.PROCESS_CRASH,
+                detail=f"could not start semgrep: {exc}",
+            )
+        raw_parts.append(run.stdout)
+        if run.status is not AttemptStatus.COMPLETED:
+            return SastOutcome(
+                status=run.status,
+                detail=f"chunk {index}/{len(chunks)}: {_failure_detail(run.exit_code, run.stderr, parsed)}",
+                raw_sha256=sha256_hex("".join(raw_parts)),
+            )
+        results.extend(parsed.get("results") or [])
+        if isinstance(parsed.get("errors"), list):
+            errors.extend(parsed["errors"])
+    findings = _findings({"results": results, "errors": errors}, root, config.max_findings)
+    detail = f"semgrep: {len(findings)} finding(s) on {len(targets)} changed file(s) in {len(chunks)} chunk(s)"
+    if errors:
         parts: list[str] = []
         for item in errors[:3]:
             if isinstance(item, dict):
@@ -141,7 +152,12 @@ def run_semgrep(
         messages = "; ".join(parts)
         if messages:
             detail = f"{detail}; semgrep reported: {messages[:500]}"
-    return SastOutcome(findings=findings, status=AttemptStatus.COMPLETED, detail=detail, raw_sha256=raw_sha256)
+    return SastOutcome(
+        findings=findings,
+        status=AttemptStatus.COMPLETED,
+        detail=detail,
+        raw_sha256=sha256_hex("".join(raw_parts)),
+    )
 
 
 def _config_value(config: SastConfig) -> str:
@@ -154,6 +170,40 @@ def _config_value(config: SastConfig) -> str:
     if looks_like_path and not Path(text).exists():
         raise ToolError(f"configured Semgrep config does not exist: {text}")
     return text
+
+
+def _target_chunks(
+    targets: Sequence[str],
+    *,
+    max_files: int = 200,
+    max_chars: int = 120_000,
+    max_chunks: int = 12,
+) -> list[list[str]]:
+    """Split a large changed-file list so argv never hits the kernel limit.
+
+    A PR with thousands of files could exceed ``ARG_MAX`` in one Semgrep
+    invocation and fail the whole static track.  Twelve chunks of at most 200
+    paths keep the command line far below the limit while preserving the
+    read-only digest and per-chunk timeout.
+    """
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    chars = 0
+    for path in targets:
+        size = len(path) + 1
+        if current and (len(current) >= max_files or chars + size > max_chars):
+            chunks.append(current)
+            current = []
+            chars = 0
+        current.append(path)
+        chars += size
+    if current:
+        chunks.append(current)
+    if len(chunks) <= max_chunks:
+        return chunks
+    # Redistribute evenly rather than leaving the tail without a chunk.
+    step = max(1, (len(targets) + max_chunks - 1) // max_chunks)
+    return [list(targets[i : i + step]) for i in range(0, len(targets), step)][:max_chunks]
 
 
 def _targets(root: Path, diff: DiffBundle) -> list[str]:
@@ -231,6 +281,7 @@ def _findings(doc: Mapping[str, Any], root: Path, limit: int) -> list[AnalyzerFi
                 track=_track(metadata),
                 cwe=_cwe(metadata.get("cwe")),
                 patch_caused=True,
+                test_context=_in_test_context(root, path, line),
             )
         )
         if len(findings) >= max(1, limit):
@@ -320,6 +371,8 @@ def apply_suppressions(
             text = texts.get(finding.path, {}).get(finding.line, "")
             if matched:
                 reason = f"path is on the analyzer suppression list ({matched})"
+            elif finding.test_context:
+                reason = "finding is inside test code"
             elif any(marker in text.lower() for marker in _INLINE_MARKERS):
                 reason = "inline suppression marker on the finding line"
             elif finding.cwe in _INJECTION_CWES:
@@ -369,3 +422,96 @@ def _added_line_text(diff: DiffBundle) -> dict[str, dict[int, str]]:
                     cursor += 1
         out[patch.path] = lines
     return out
+
+
+def _in_test_context(root: Path, path: str, line: int) -> bool:
+    """True when a finding sits in test code rather than production code.
+
+    Test doubles intentionally unwrap, assert and index without the production
+    guards.  Reporting those as security defects fills the top-3 with noise and
+    hides the production finding behind it.
+    """
+    if _test_path(path):
+        return True
+    try:
+        lines = _source_lines(str((Path(root) / path).resolve()))
+    except OSError:
+        return False
+    suffix = Path(path).suffix.lower()
+    if suffix == ".rs":
+        return _rust_test_line(lines, line)
+    if suffix in (".py", ".pyi"):
+        return _python_test_line(lines, line)
+    return False
+
+
+def _test_path(path: str) -> bool:
+    low = path.lower().replace("\\", "/")
+    name = low.rsplit("/", 1)[-1]
+    return (
+        low.startswith("tests/")
+        or low.startswith("test/")
+        or "/tests/" in low
+        or "/test/" in low
+        or name.startswith("test_")
+        or ".test." in low
+        or ".spec." in low
+        or name.endswith("_test.py")
+        or name.endswith("_test.rs")
+    )
+
+
+@lru_cache(maxsize=512)
+def _source_lines(path: str) -> tuple[str, ...]:
+    return tuple(Path(path).read_text(encoding="utf-8", errors="replace").splitlines())
+
+
+def _brace_end(lines: Sequence[str], start: int) -> int:
+    depth = 0
+    opened = False
+    for index in range(start, len(lines)):
+        depth += lines[index].count("{") - lines[index].count("}")
+        opened = opened or "{" in lines[index]
+        if opened and depth <= 0:
+            return index + 1
+    return len(lines)
+
+
+def _rust_test_line(lines: Sequence[str], line: int) -> bool:
+    for index, text in enumerate(lines):
+        if "#[cfg(test)]" in text:
+            for cursor in range(index, min(index + 5, len(lines))):
+                if re.search(r"\bmod\s+\w+", lines[cursor]):
+                    start = cursor + 1
+                    end = _brace_end(lines, cursor)
+                    if start <= line <= end:
+                        return True
+                    break
+        if "#[test]" in text:
+            for cursor in range(index, min(index + 4, len(lines))):
+                if re.search(r"\bfn\s+\w+", lines[cursor]):
+                    start = cursor + 1
+                    end = _brace_end(lines, cursor)
+                    if start <= line <= end:
+                        return True
+                    break
+    return False
+
+
+def _python_test_line(lines: Sequence[str], line: int) -> bool:
+    for index, text in enumerate(lines):
+        match = re.match(r"^(\s*)def\s+test_", text)
+        if not match:
+            continue
+        indent = len(match.group(1))
+        end = len(lines)
+        for cursor in range(index + 1, len(lines)):
+            body = lines[cursor]
+            if not body.strip():
+                continue
+            if len(body) - len(body.lstrip()) <= indent:
+                end = cursor
+                break
+        if index + 1 <= line <= end:
+            return True
+    return False

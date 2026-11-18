@@ -959,7 +959,9 @@ def build_context(
     budget = max(1, int(settings.max_model_tokens))
     units: list[ContextUnit] = []
     truncated = bool(diff.truncated)
+    material_truncated = bool(diff.truncated)
     dropped = 0
+    dropped_diff = 0
     focus = {item.path for item in (plan.focus if plan is not None else ())}
 
     # -- the changed code: one unit per file, the highest priority ---------
@@ -970,6 +972,7 @@ def build_context(
             continue
         text, cut = _cap(body, diff_cap)
         truncated = truncated or cut
+        material_truncated = material_truncated or cut
         priority = (
             PRIORITY_FOCUS_DIFF if patch.path in focus else PRIORITY_DIFF
         )
@@ -1120,6 +1123,8 @@ def build_context(
             used += cost
         else:
             dropped += 1
+            if unit.kind == "diff":
+                dropped_diff += 1
 
     text = _join(kept)
     total = _count_or_zero(counter, text)
@@ -1136,8 +1141,10 @@ def build_context(
         text = text[:limit]
         total = _count_or_zero(counter, text)
         truncated = True
+        material_truncated = True
 
     truncated = truncated or dropped > 0
+    material_truncated = material_truncated or dropped_diff > 0
     unresolved = sorted({view.name for view in [*symbols, *planned] if view.unresolved})
     return ContextSlice(
         text=text,
@@ -1151,4 +1158,5 @@ def build_context(
         input_sha256=sha256_hex(text),
         input_bytes=len(text.encode("utf-8")),
         truncated=truncated,
+        material_truncated=material_truncated,
     )

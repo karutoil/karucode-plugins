@@ -50,10 +50,26 @@ def test_a_binary_blob_does_not_crash_a_symbol_scan(tmp_path) -> None:
     assert "assets/logo.png" in files
 
 
-def test_reasoning_effort_defaults_low_and_is_configurable() -> None:
+def test_reasoning_effort_defaults_high_for_review_and_low_for_triage() -> None:
     settings = load_settings({}, {})
-    assert settings.llm.primary.reasoning_effort == "low"
-    assert settings.llm.reviewer.reasoning_effort == "low"
-    assert settings.llm.monitor.reasoning_effort == "low"
-    raised = load_settings({"model.reasoning_effort": "high"}, {})
-    assert raised.llm.security.reasoning_effort == "high"
+    assert settings.llm.primary.reasoning_effort == "high"
+    assert settings.llm.security.reasoning_effort == "high"
+    assert settings.llm.reviewer.reasoning_effort == "high"
+    assert settings.llm.monitor.reasoning_effort == "medium"
+    assert settings.llm.triage.reasoning_effort == "low"
+    assert settings.llm.probe.reasoning_effort == "medium"
+    lowered = load_settings({"model.reviewer_reasoning_effort": "low"}, {})
+    assert lowered.llm.reviewer.reasoning_effort == "low"
+
+
+def test_context_and_output_defaults_are_500k_and_64k() -> None:
+    settings = load_settings({}, {})
+    assert settings.max_model_tokens == 500_000
+    assert settings.llm.primary.max_tokens == 65_536
+    assert settings.llm.reviewer.max_tokens == 65_536
+    assert settings.llm.monitor.max_tokens == 65_536
+
+
+def test_output_tokens_can_be_configured_without_a_host_setting() -> None:
+    settings = load_settings({"model.max_tokens": 32_000}, {})
+    assert settings.llm.security.max_tokens == 32_000

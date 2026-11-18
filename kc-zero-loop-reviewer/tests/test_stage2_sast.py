@@ -272,3 +272,26 @@ def test_missing_configured_rules_is_a_typed_failure(tmp_path):
     outcome = run_semgrep(tmp_path, diff, settings)
     assert outcome.status is AttemptStatus.TOOL_UNAVAILABLE
     assert "does not exist" in outcome.detail
+
+
+def test_inline_rust_test_module_is_test_context(tmp_path) -> None:
+    from zero_loop_reviewer.stage2.sast import _in_test_context
+
+    source = (
+        "pub fn parse(raw: Option<i32>) -> i32 {\n"
+        "    raw.unwrap()\n"
+        "}\n"
+        "\n"
+        "#[cfg(test)]\n"
+        "mod tests {\n"
+        "    #[test]\n"
+        "    fn parses() {\n"
+        "        assert_eq!(super::parse(Some(1)), 1);\n"
+        "    }\n"
+        "}\n"
+    )
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "lib.rs").write_text(source, encoding="utf-8")
+    assert _in_test_context(tmp_path, "src/lib.rs", 2) is False
+    assert _in_test_context(tmp_path, "src/lib.rs", 9) is True
+    assert _in_test_context(tmp_path, "tests/helper.rs", 2) is True

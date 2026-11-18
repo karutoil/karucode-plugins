@@ -11,7 +11,7 @@ import pytest
 
 from tests.support.gitfix import make_repo, run
 from tests.support.llm import ScriptedLLM
-from zero_loop_reviewer.config import Settings
+from zero_loop_reviewer.config import Settings, load_settings
 from zero_loop_reviewer.gitops import GitRepo
 from zero_loop_reviewer.models import (
     Candidate,
@@ -315,3 +315,28 @@ def test_a_minimal_model_patch_without_trailing_context_applies(tmp_path) -> Non
     result = _apply_patch(patch, tree, LocalCommandRunner(), Settings().with_paths(tmp_path / "state"), work)
     assert result == ""
     assert "unwrap_or(0)" in (tree / "src" / "lib.rs").read_text(encoding="utf-8")
+
+
+def test_rule_present_is_scoped_to_the_candidate_line(tmp_path) -> None:
+    from zero_loop_reviewer.pipeline import _rule_present
+
+    tree = tmp_path / "tree"
+    (tree / "src").mkdir(parents=True)
+    target = tree / "src" / "lib.rs"
+    target.write_text(
+        "pub fn a(raw: Option<i32>) -> i32 {\n    raw.unwrap()\n}\n"
+        "pub fn b(raw: Option<i32>) -> i32 {\n    raw.unwrap()\n}\n",
+        encoding="utf-8",
+    )
+    settings = load_settings(
+        {"sast.semgrep_config": str(Path(__file__).resolve().parents[1] / "rules")}, {}
+    )
+    assert _rule_present(tree, "src/lib.rs", "rust-unwrap", settings, 30, line=2) is True
+    assert _rule_present(tree, "src/lib.rs", "rust-unwrap", settings, 30, line=5) is True
+    target.write_text(
+        "pub fn a(raw: Option<i32>) -> i32 {\n    raw.unwrap_or(0)\n}\n"
+        "pub fn b(raw: Option<i32>) -> i32 {\n    raw.unwrap()\n}\n",
+        encoding="utf-8",
+    )
+    assert _rule_present(tree, "src/lib.rs", "rust-unwrap", settings, 30, line=2) is False
+    assert _rule_present(tree, "src/lib.rs", "rust-unwrap", settings, 30, line=5) is True

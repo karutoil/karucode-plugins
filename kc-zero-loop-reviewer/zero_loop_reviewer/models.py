@@ -309,6 +309,7 @@ class ContextSlice(StrictModel):
     input_sha256: str = ""
     input_bytes: int = 0
     truncated: bool = False
+    material_truncated: bool = False
 
 
 class DesignPrecedent(StrictModel):
@@ -416,6 +417,7 @@ class AnalyzerFinding(StrictModel):
     patch_caused: bool = True
     suppressed: bool = False
     suppression_reason: str = ""
+    test_context: bool = False
 
 
 class TaintTuple(StrictModel):

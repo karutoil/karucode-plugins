@@ -129,7 +129,7 @@ git provider / CI job / karucode tool call
                 │
                 ▼
  stage 1  RuntimeContract ── receipts ── HeadCommitGate ── PR-MCI isolation
-          ContextSlicer (1-hop symbols, conventions, DesignLore, 128k budget)
+          ContextSlicer (1-hop symbols, conventions, DesignLore, 500k budget)
                 │
                 ▼
  stage 2  parallel executor (asyncio, ≤60 s)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -30,6 +31,7 @@ from .models import (
     Decision,
     DiffBundle,
     Evidence,
+    FilePatch,
     Finding,
     FindingStatus,
     FusionResult,
@@ -67,6 +69,19 @@ from .stage4 import oblivul as oblivul_mod
 from .stage5 import elicit as elicit_mod
 from .stage5 import formatter as formatter_mod
 from .stage5 import fusion as fusion_mod
+
+#: Behavioural LLM calls are bounded so a thousand-line PR is still reviewed in
+#: file-sized batches instead of silently looking at the first file.
+MAX_BEHAVIOR_BATCHES = 24
+MAX_BEHAVIOR_FILES_PER_BATCH = 4
+MAX_BEHAVIOR_BATCH_CHARS = 30_000
+MAX_BEHAVIOR_CANDIDATES = 24
+BEHAVIOR_WORKERS = 4
+
+#: Stage 3/4 are expensive and model-backed; the top candidates get the budget,
+#: the rest stay unverified and therefore cannot be published silently.
+MAX_PROBED_CANDIDATES = 8
+MAX_CIVER_CANDIDATES = 8
 from .stage5 import redaction as redaction_mod
 
 
@@ -362,8 +377,6 @@ class Reviewer:
             run.degraded.append(f"diff_failed: {exc}")
             return self._finish(review_id, request, repo, head_sha, run, budget, force_human=True)
         run.diff = diff
-        if diff.truncated:
-            run.degraded.append("diff_truncated: the patch exceeded the 8 MB safety ceiling")
 
         # ---- Stage 1: context, triage, PR-MCI -------------------------------
         started = _now()
@@ -399,6 +412,12 @@ class Reviewer:
             input_sha256=run.context.input_sha256,
             input_bytes=run.context.input_bytes,
         )
+        if run.context.material_truncated:
+            run.degraded.append(
+                "context_truncated: the token budget could not hold every changed file and its 1-hop context"
+            )
+        if diff.truncated:
+            run.degraded.append("diff_truncated: only the first 8 MB of the patch was read")
 
         if request.description.strip():
             started = _now()
@@ -467,7 +486,21 @@ class Reviewer:
         blind_spots = [
             entry
             for entry in run.degraded
-            if entry.startswith(("2a ", "2b ", "2c ", "stage2_failed", "behavioral_scan_degraded"))
+            if entry.startswith(
+                (
+                    "2a ",
+                    "2b ",
+                    "2c ",
+                    "stage2_failed",
+                    "stage 2 ",
+                    "behavioral_scan_degraded",
+                    "behavioral_coverage_incomplete",
+                    "probe_coverage_incomplete",
+                    "civer_coverage_incomplete",
+                    "context_truncated",
+                    "diff_truncated",
+                )
+            )
         ]
         return self._finish(
             review_id,
@@ -495,62 +528,121 @@ class Reviewer:
         This is candidate generation, not a verdict: nothing here can approve or
         reject.  A draft whose cited site is outside the changed lines is
         discarded, which is what stops a hallucinated path from becoming a
-        finding.
+        finding.  Large PRs are split into file-sized batches: a single 16k
+        evidence block only ever sees the first files, and approving the rest
+        unseen is exactly the failure mode this stage must not have.
         """
         if budget.remaining() < 20.0:
             return []
+        batches, capped_batches, oversized = _behavioral_batches(diff)
+        if not batches:
+            return []
         started = _now()
-        try:
-            prompt = behavioral_prompt(diff, context, plan=plan)
-            answer = self.llm.complete(
-                "behavioral", prompt, BehavioralCandidates, stage_model=self.settings.llm.reviewer
-            )
-            drafts = answer.value.candidates
-        except LLMError as exc:
-            run.degraded.append(f"behavioral_scan_degraded: {exc.kind.value}: {exc.message}")
-            self._record("2.behavioral", exc.kind, started, exc.message)
-            return []
-        except Exception as exc:
-            run.degraded.append(f"behavioral_scan_degraded: {type(exc).__name__}: {exc}")
-            self._record("2.behavioral", AttemptStatus.PROCESS_CRASH, started, str(exc))
-            return []
         kept: list[Candidate] = []
+        seen: set[str] = set()
         rejected = 0
-        for draft in drafts:
-            sites = [
-                site
-                for site in draft.cited_sites
-                if _site_in_diff(diff, site) and _groundable(site, analyzer_findings)
-            ]
-            if not sites:
-                rejected += 1
-                continue
-            trigger = f" Trigger: {draft.suspected_trigger}" if draft.suspected_trigger else ""
-            kept.append(
-                Candidate(
-                    id=_candidate_id("3", sites[0].path, sites[0].line, draft.title),
-                    stage=StageId.PROBE,
-                    category=draft.category,
-                    title=draft.title,
-                    root_cause=(draft.root_cause + trigger)[:4000],
-                    severity=_severity(draft.severity),
-                    cited_sites=sites,
-                    evidence=Evidence(
-                        kind="llm_hypothesis",
-                        analyzer="behavioral-scan",
-                        trace=sites,
-                        detail="a grounded hypothesis; it becomes a finding only after mechanical verification",
-                    ),
-                )
+        failed = 0
+        # A huge PR can spend an hour, but a 4-minute review must not start 17
+        # five-minute calls.  One batch is budgeted at ~2 minutes of wall time;
+        # the rest are a declared blind spot, not a silent omission.
+        allowed = min(len(batches), max(1, int(budget.remaining() / 120)))
+        if allowed < len(batches):
+            capped_batches = True
+            batches = batches[:allowed]
+        self._cap_llm(budget)
+
+        def run_batch(index: int, batch: list[FilePatch]) -> tuple[int, list[Any]]:
+            batch_diff = diff.model_copy(update={"files": batch})
+            batch_context = _context_for_batch(context, {patch.path for patch in batch})
+            answer = self.llm.complete(
+                "behavioral",
+                behavioral_prompt(batch_diff, batch_context, plan=plan),
+                BehavioralCandidates,
+                stage_model=self.settings.llm.reviewer,
             )
+            return index, list(answer.value.candidates)
+
+        workers = min(BEHAVIOR_WORKERS, len(batches))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(run_batch, index, batch): (index, batch)
+                for index, batch in enumerate(batches, 1)
+            }
+            for future in as_completed(futures):
+                index, batch = futures[future]
+                batch_diff = diff.model_copy(update={"files": batch})
+                try:
+                    _, drafts = future.result()
+                except LLMError as exc:
+                    failed += 1
+                    run.degraded.append(
+                        f"behavioral_scan_degraded: batch {index}/{len(batches)}: {exc.kind.value}: {exc.message}"
+                    )
+                    self._record("2.behavioral.batch", exc.kind, started, f"batch {index}: {exc.message}")
+                    continue
+                except Exception as exc:
+                    failed += 1
+                    run.degraded.append(
+                        f"behavioral_scan_degraded: batch {index}/{len(batches)}: {type(exc).__name__}: {exc}"
+                    )
+                    self._record(
+                        "2.behavioral.batch", AttemptStatus.PROCESS_CRASH, started, f"batch {index}: {exc}"
+                    )
+                    continue
+                for draft in drafts:
+                    sites = [
+                        site
+                        for site in draft.cited_sites
+                        if _site_in_diff(batch_diff, site) and _groundable(site, analyzer_findings)
+                    ]
+                    if not sites:
+                        rejected += 1
+                        continue
+                    if len(kept) >= MAX_BEHAVIOR_CANDIDATES:
+                        rejected += 1
+                        continue
+                    trigger = f" Trigger: {draft.suspected_trigger}" if draft.suspected_trigger else ""
+                    candidate = Candidate(
+                        id=_candidate_id("3", sites[0].path, sites[0].line, draft.title),
+                        stage=StageId.PROBE,
+                        category=draft.category,
+                        title=draft.title,
+                        root_cause=(draft.root_cause + trigger)[:4000],
+                        severity=_severity(draft.severity),
+                        cited_sites=sites,
+                        evidence=Evidence(
+                            kind="llm_hypothesis",
+                            analyzer="behavioral-scan",
+                            trace=sites,
+                            detail="a grounded hypothesis; it becomes a finding only after mechanical verification",
+                        ),
+                    )
+                    if candidate.id in seen:
+                        continue
+                    seen.add(candidate.id)
+                    kept.append(candidate)
+                self._record(
+                    "2.behavioral.batch",
+                    AttemptStatus.COMPLETED,
+                    started,
+                    f"batch {index}/{len(batches)}: {len(drafts)} draft(s), {len(kept)} kept so far",
+                )
         self._record(
             "2.behavioral",
-            AttemptStatus.COMPLETED,
+            AttemptStatus.COMPLETED if not failed else AttemptStatus.SKIPPED,
             started,
-            f"{len(kept)} diff-anchored hypotheses kept, {rejected} rejected as unanchored",
+            f"{len(kept)} hypotheses from {len(batches)} batch(es), {rejected} rejected, {failed} batch failure(s)",
         )
         if rejected:
-            run.degraded.append(f"behavioral_scan_filtered: {rejected} hypothesis(es) cited lines outside the diff")
+            run.degraded.append(f"behavioral_scan_filtered: {rejected} hypothesis(es) were unanchored or over the cap")
+        if capped_batches:
+            run.degraded.append(
+                f"behavioral_coverage_incomplete: only {len(batches)} of the ranked file batches fit the review budget"
+            )
+        if oversized:
+            run.degraded.append(
+                "behavioral_coverage_incomplete: at least one changed file is larger than a single evidence block"
+            )
         return kept
 
     # ------------------------------------------------------------------ #
@@ -573,6 +665,7 @@ class Reviewer:
         if not ok:
             run.degraded.append(f"sandbox_unavailable: {detail}")
         updated: list[Candidate] = []
+        probed = 0
         stage_settings = replace(
             self.settings,
             sandbox=replace(
@@ -588,6 +681,7 @@ class Reviewer:
             self._cap_llm(budget)
             if not ok or budget.remaining() < 20.0:
                 updated.append(candidate)
+                run.degraded.append("probe_coverage_incomplete: the deadline ended probe synthesis")
                 continue
             if not _probe_supported(candidate):
                 updated.append(candidate)
@@ -598,6 +692,13 @@ class Reviewer:
                     f"{candidate.id}: no probe framework for {candidate.cited_sites[0].path if candidate.cited_sites else 'the cited site'}",
                 )
                 continue
+            if probed >= MAX_PROBED_CANDIDATES:
+                updated.append(candidate)
+                run.degraded.append(
+                    f"probe_coverage_incomplete: only the first {MAX_PROBED_CANDIDATES} candidates were probed"
+                )
+                continue
+            probed += 1
             started = _now()
             try:
                 result, new_pairs, degraded = cascade_mod.run_cascade(
@@ -702,6 +803,7 @@ class Reviewer:
         }
         head_tree: Path | None = None
         out: list[Candidate] = []
+        civer_calls = 0
         try:
             for candidate in sorted(candidates, key=lambda c: (-_severity(c.severity), c.id)):
                 if candidate.status is FindingStatus.SUPPRESSED:
@@ -821,7 +923,13 @@ class Reviewer:
                 if budget.remaining() > 20.0 and (
                     probe_capable or bool(candidate.evidence.rule_id)
                 ):
-                    candidate = self._civer(candidate, run, repo, diff, budget, probe_capable)
+                    if civer_calls >= MAX_CIVER_CANDIDATES:
+                        run.degraded.append(
+                            f"civer_coverage_incomplete: only the first {MAX_CIVER_CANDIDATES} candidates received repair verification"
+                        )
+                    else:
+                        civer_calls += 1
+                        candidate = self._civer(candidate, run, repo, diff, budget, probe_capable)
                 out.append(candidate)
         finally:
             if head_tree is not None:
@@ -893,6 +1001,8 @@ class Reviewer:
                     rule,
                     budget_settings,
                     budget.grant(45.0),
+                    candidate.cited_sites[0].line,
+                    candidate.cited_sites[0].end_line,
                 )
 
         started = _now()
@@ -1359,6 +1469,143 @@ def _site_in_diff(diff: DiffBundle, site: CitedSite) -> bool:
     return any(abs(site.line - line) <= 2 for line in changed)
 
 
+_BEHAVIOR_EXTENSIONS = {
+    ".py", ".pyi", ".rs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".go", ".java", ".kt", ".rb", ".php", ".c", ".h", ".cc", ".cpp", ".hpp",
+    ".cs", ".swift", ".scala", ".ex", ".exs",
+}
+_BEHAVIOR_SKIP_PARTS = {
+    "node_modules", "target", "dist", "build", "vendor", "third_party",
+    "site", ".git", ".venv", "venv", "__pycache__",
+}
+_BEHAVIOR_RISK_WORDS = (
+    "auth", "security", "session", "token", "payment", "billing", "db",
+    "sql", "exec", "parse", "io", "api", "route", "handler",
+)
+
+
+def _behavioral_eligible(patch: FilePatch) -> bool:
+    if patch.is_binary or patch.is_deleted or not patch.changed_lines:
+        return False
+    path = patch.path.replace("\\", "/")
+    if any(part in _BEHAVIOR_SKIP_PARTS for part in Path(path).parts):
+        return False
+    return Path(path).suffix.lower() in _BEHAVIOR_EXTENSIONS
+
+
+def _behavioral_weight(patch: FilePatch) -> int:
+    score = min(200, len(patch.changed_lines))
+    low = patch.path.lower()
+    if any(word in low for word in _BEHAVIOR_RISK_WORDS):
+        score += 50
+    if "test" in low or "spec" in low:
+        score -= 20
+    return score
+
+
+def _is_test_path(path: str) -> bool:
+    low = path.lower()
+    return (
+        "/tests/" in low
+        or "/test/" in low
+        or Path(low).name.startswith("test_")
+        or ".test." in low
+        or ".spec." in low
+        or low.endswith("_test.py")
+        or low.endswith("_test.rs")
+    )
+
+
+def _split_large_patch(patch: FilePatch) -> tuple[list[FilePatch], bool]:
+    """Split a large file diff at hunk boundaries for behavioural batches."""
+    hunks = list(patch.hunks)
+    if not hunks:
+        return [patch], True
+    chunks: list[list] = []
+    current: list = []
+    chars = 0
+    unsplittable = False
+    for hunk in hunks:
+        size = len(hunk.header) + sum(len(line) + 1 for line in hunk.lines)
+        if size > MAX_BEHAVIOR_BATCH_CHARS:
+            unsplittable = True
+        if current and chars + size > MAX_BEHAVIOR_BATCH_CHARS:
+            chunks.append(current)
+            current = []
+            chars = 0
+        current.append(hunk)
+        chars += size
+    if current:
+        chunks.append(current)
+    return (
+        [
+            patch.model_copy(
+                update={
+                    "hunks": group,
+                    "additions": sum(len(hunk.added_lines) for hunk in group),
+                    "deletions": sum(hunk.old_lines for hunk in group),
+                }
+            )
+            for group in chunks
+        ],
+        unsplittable,
+    )
+
+
+def _behavioral_batches(
+    diff: DiffBundle,
+) -> tuple[list[list[FilePatch]], bool, bool]:
+    """Rank changed source files and group them into evidence-sized batches."""
+    files = sorted(
+        (patch for patch in diff.files if _behavioral_eligible(patch)),
+        key=lambda patch: (-_behavioral_weight(patch), patch.path),
+    )
+    if not files:
+        return [], False, False
+    units: list[FilePatch] = []
+    oversized = False
+    for patch in files:
+        if len(patch.patch_text()) <= MAX_BEHAVIOR_BATCH_CHARS:
+            units.append(patch)
+            continue
+        split, unsplittable = _split_large_patch(patch)
+        if unsplittable and _is_test_path(patch.path):
+            # A generated test fixture with one enormous hunk is not worth a
+            # human review by itself; the rule packs still scan it.
+            continue
+        units.extend(split)
+        oversized = oversized or unsplittable
+    batches: list[list[FilePatch]] = []
+    current: list[FilePatch] = []
+    chars = 0
+    for patch in units:
+        size = len(patch.patch_text())
+        if current and (
+            chars + size > MAX_BEHAVIOR_BATCH_CHARS
+            or len(current) >= MAX_BEHAVIOR_FILES_PER_BATCH
+        ):
+            batches.append(current)
+            current = []
+            chars = 0
+        current.append(patch)
+        chars += size
+    if current:
+        batches.append(current)
+    capped = len(batches) > MAX_BEHAVIOR_BATCHES
+    return batches[:MAX_BEHAVIOR_BATCHES], capped, oversized
+
+
+def _context_for_batch(context: ContextSlice, paths: set[str]) -> ContextSlice:
+    selected = [
+        unit
+        for unit in context.units
+        if unit.kind != "diff" or unit.source in paths
+    ]
+    text = "\n\n".join(unit.text for unit in selected) or context.text
+    text = text[: MAX_BEHAVIOR_BATCH_CHARS * 2]
+    return context.model_copy(update={"text": text, "tokens": max(1, len(text) // 4)})
+
+
 def _probe_supported(candidate: Candidate) -> bool:
     """Probe synthesis currently emits Python tests only.
 
@@ -1422,8 +1669,22 @@ def _sink_path(frame: Any) -> str:
     return frame.path
 
 
-def _rule_present(tree: Path, rel_path: str, rule_id: str, settings: Settings, timeout_s: float) -> bool:
-    """Rerun the shipped Semgrep rules on one file of a scratch tree."""
+def _rule_present(
+    tree: Path,
+    rel_path: str,
+    rule_id: str,
+    settings: Settings,
+    timeout_s: float,
+    line: int | None = None,
+    end_line: int | None = None,
+) -> bool:
+    """Rerun the shipped Semgrep rules on one file of a scratch tree.
+
+    When ``line`` is given, only a result within a few lines of that site counts.
+    A file can contain several findings of the same rule; removing one must not
+    leave CIVER believing the candidate's defect is still present just because
+    its siblings remain.
+    """
     if not rule_id:
         return False
     config = settings.sast.semgrep_config or str(Path(__file__).resolve().parents[1] / "rules")
@@ -1450,6 +1711,18 @@ def _rule_present(tree: Path, rel_path: str, rule_id: str, settings: Settings, t
         return True
     for result in doc.get("results", []):
         check = str(result.get("check_id", ""))
-        if check == rule_id or check.endswith("." + rule_id) or rule_id in check:
-            return True
+        if not (check == rule_id or check.endswith("." + rule_id) or rule_id in check):
+            continue
+        if line is not None:
+            start = result.get("start") if isinstance(result, dict) else None
+            end = result.get("end") if isinstance(result, dict) else None
+            found_start = start.get("line") if isinstance(start, dict) else None
+            found_end = end.get("line") if isinstance(end, dict) else None
+            if isinstance(found_start, int):
+                high = end_line if end_line is not None else line
+                found_high = found_end if isinstance(found_end, int) else found_start
+                # Overlap between the candidate's cited range and the rule hit.
+                if found_high < line - 2 or found_start > high + 2:
+                    continue
+        return True
     return False

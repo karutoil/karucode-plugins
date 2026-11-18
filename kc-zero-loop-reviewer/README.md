@@ -7,7 +7,7 @@ loops.
 Five stages run inside a 1–4 minute CI budget:
 
 1. **Contract + context** — six-property runtime contract, exact-head gate,
-   PR-description isolation, 1-hop symbols, conventions, a 128k-token budget.
+   PR-description isolation, 1-hop symbols, conventions, a 500k-token context budget and 64k output.
 2. **Parallel static/ensemble** — patch-caused Semgrep delta, a secSemScan
    security monologue reconciled against the analyzer trace, CPG frames, and
    the RALE `(AST && CFG) || Code` ensemble.
@@ -62,9 +62,9 @@ values:
 | `model.monitor_alt` | empty | Second-provider monitor model |
 | `llm.base_url` | empty | OpenAI-compatible API root (`http://127.0.0.1:4000/v1`, a hosted endpoint, …) |
 | `llm.api_key_env` | `ZERO_LOOP_LLM_API_KEY` | **Name** of the key variable; no secret is stored |
-| `review.deadline_secs` | `240` | Hard review budget |
+| `review.deadline_secs` | `240` | Hard review budget; set `3600` for a huge PR |
 | `review.stage2_timeout_secs` | `60` | One parallel static track |
-| `review.max_model_tokens` | `128000` | Compressed context ceiling |
+| `review.max_model_tokens` | `500000` | Context ceiling (tokens) |
 | `fusion.c_fr` / `fusion.c_fa` | `10` / `1` | Coded Bayes τ = C_FR/(C_FA+C_FR) = 0.909; host-side only |
 | `fusion.monitor_votes` | `5` | Independent monitor samples |
 | `fusion.disagreement_threshold` | `0.55` | Wider reviewer/monitor gap → human review |
@@ -76,6 +76,13 @@ values:
 | `gate.require_approval` | `false` | Turn on only for a merge gate, not a review trigger |
 | `ci.provider` / `ci.token_env` | `none` / `GITHUB_TOKEN` | Git provider and **name** of its token variable |
 | `state.dir` | `~/.local/state/zero-loop-reviewer` | Receipts, worktrees, private security log |
+
+`model.max_tokens` (TOML/env, default `65536`) is the output ceiling for every
+stage. Reasoning effort is per stage: `high` for security/reviewer, `medium`
+for probe/monitor, `low` for triage. Override with
+`model.{triage,security,probe,reviewer,monitor}_reasoning_effort` or the global
+`model.reasoning_effort` in TOML/env; these are deliberately not host settings,
+so the host's 32-setting limit stays intact.
 
 Endpoint fallbacks when `llm.base_url` is empty:
 `ZERO_LOOP_LLM_BASE_URL` → `LITELLM_BASE_URL` → `OPENAI_BASE_URL` →
@@ -163,7 +170,7 @@ non-loopback bind without a secret is refused. The secret variable is
 
 `./check.sh` runs everything below. On this machine:
 
-* **431 tests pass** (real git, real Semgrep 1.173.0, real podman 5.4.2,
+* **438 tests pass** (real git, real Semgrep 1.173.0, real podman 5.4.2,
   a real OpenAI-compatible HTTP fake for the client tests).
 * `python3 eval/run_eval.py` on the annotated corpus: **6/6 buggy cases
   intercepted, 0/4 clean or fix-confirming cases flagged**, in ~33 s for all ten cases.
@@ -200,6 +207,31 @@ approves with no comments; that is the intended result, not a failure to run.
 Pullfrog and CodeRabbit can comment on a clean YAML diff because they publish
 ungrounded LLM opinions; this reviewer only comments on a mechanically
 verified finding or reports `human_review`.
+
+## Large PRs
+
+The diff is read up to an 8 MB safety ceiling and the context assembler may use
+up to **500k tokens**; the model output ceiling is **64k tokens**. Behavioural
+review is file-ranked and batched: up to 24 batches of 4 source files / 30k
+characters, four batches in flight at once. Large files are split at hunk
+boundaries; a file with one enormous hunk is a declared blind spot unless it is
+a test file. Semgrep scans the complete changed-file set in chunks of at most
+200 paths, and up to 24 hypotheses reach the probe/CIVER stages, which are
+capped at 8 each. Only the top 3 verified findings are published.
+
+A 1,000–2,000 line PR usually takes one to three model calls. A 9k-line,
+83-file PR is about 23 calls and can legitimately take 20–40 minutes; the
+workflow budget is **3600 s** and its job timeout is 75 minutes. The default
+`review.deadline_secs=240` remains for ordinary PRs, so a small PR is still
+reviewed in a few minutes.
+
+Coverage is allowed to be *incomplete*, never silently green. A truncated diff
+or context, a capped batch scan, an oversized production-file hunk, or a
+probe/CIVER cap adds a blind spot; if no finding is verified the verdict is
+`human_review`. A verified finding still produces `request_changes` and a
+committed suggestion. Generated/vendor/lock/doc files and findings inside test
+modules are excluded from publication, but the rule packs still scan their
+changed lines.
 
 ## Why a clean diff has no comments
 
