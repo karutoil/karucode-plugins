@@ -233,6 +233,15 @@ def test_github_parse_review_event() -> None:
     )
 
 
+def test_github_ready_for_review_is_a_review_action() -> None:
+    # The workflow triggers on ready_for_review; if the provider drops it the
+    # job exits green without ever reviewing the PR.
+    body = encode(github_payload(action="ready_for_review"))
+    event = webhook.parse("github", body, github_headers(body))
+    assert event.kind == "review"
+    assert event.action == "ready_for_review"
+
+
 def test_github_ignores_drafts_other_actions_and_other_events() -> None:
     draft_body = encode(github_payload(draft=True))
     draft = webhook.parse("github", draft_body, github_headers(draft_body))

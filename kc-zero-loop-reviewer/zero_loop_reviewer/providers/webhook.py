@@ -36,7 +36,7 @@ MAX_BODY_BYTES = 8 * 1024 * 1024
 PROVIDERS = ("github", "gitlab", "bitbucket")
 _TIMESTAMP_HEADERS = ("x-timestamp", "x-request-timestamp")
 _REVIEW_ACTIONS = {
-    "github": frozenset({"opened", "reopened", "synchronize"}),
+    "github": frozenset({"opened", "reopened", "synchronize", "ready_for_review"}),
     "gitlab": frozenset({"open", "reopen", "update"}),
     "bitbucket": frozenset({"pullrequest:created", "pullrequest:updated"}),
 }
