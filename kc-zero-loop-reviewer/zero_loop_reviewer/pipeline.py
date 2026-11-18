@@ -82,8 +82,8 @@ BEHAVIOR_WORKERS = 4
 
 #: Stage 3/4 are expensive and model-backed; the top candidates get the budget,
 #: the rest stay unverified and therefore cannot be published silently.
-MAX_PROBED_CANDIDATES = 8
-MAX_CIVER_CANDIDATES = 8
+MAX_PROBED_CANDIDATES = 16
+MAX_CIVER_CANDIDATES = 16
 from .stage5 import redaction as redaction_mod
 
 

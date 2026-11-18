@@ -219,7 +219,7 @@ characters, four batches in flight at once. Large files are split at hunk
 boundaries; a file with one enormous hunk is a declared blind spot unless it is
 a test file. Semgrep scans the complete changed-file set in chunks of at most
 200 paths, and up to 24 hypotheses reach the probe/CIVER stages, which are
-capped at 8 each. Up to the configured `review.max_findings` verified findings
+capped at 16 each. Up to the configured `review.max_findings` verified findings
 are published (default 10; max 50).
 
 A 1,000–2,000 line PR usually takes one to three model calls. A 9k-line,
