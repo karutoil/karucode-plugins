@@ -525,3 +525,13 @@ def test_go_probe_path_and_image() -> None:
     assert view.image_for("go").endswith("golang:1.23-alpine")
     script = probe_script("calc/calc_test.go", "d" * 64, framework="go", image="go:1")
     assert "go test ./calc -run Test" in script
+
+
+def test_container_argv_uses_the_selected_language_image(tmp_path) -> None:
+    from zero_loop_reviewer.stage3.sandbox import SandboxConfigView, container_argv
+
+    view = SandboxConfigView(image="python:base")
+    argv = container_argv(view, tmp_path, "echo hi", image="rust:1.89-slim")
+    assert argv[-4] == "rust:1.89-slim"
+    fallback = container_argv(view, tmp_path, "echo hi")
+    assert fallback[-4] == "python:base"

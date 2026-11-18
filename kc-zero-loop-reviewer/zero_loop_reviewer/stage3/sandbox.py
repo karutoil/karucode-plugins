@@ -391,7 +391,9 @@ def probe_script(
     )
 
 
-def container_argv(view: SandboxConfigView, scratch: Path, script: str) -> list[str]:
+def container_argv(
+    view: SandboxConfigView, scratch: Path, script: str, *, image: str = ""
+) -> list[str]:
     """The exact ``podman run`` invocation; every isolation flag is mandatory."""
     return [
         view.runtime,
@@ -412,7 +414,7 @@ def container_argv(view: SandboxConfigView, scratch: Path, script: str) -> list[
         *view.extra_args,
         f"--volume={Path(scratch)}:{PROBE_ROOT}:rw",
         f"--workdir={PROBE_ROOT}",
-        view.image,
+        image or view.image,
         "/bin/sh",
         "-c",
         script,
@@ -709,7 +711,7 @@ class PodmanSandbox:
                 image=image,
                 adapter_command=adapter.command if adapter is not None and not adapter.builtin else None,
             )
-            argv = container_argv(self.view, scratch, script)
+            argv = container_argv(self.view, scratch, script, image=image)
             run = run_bounded(
                 argv,
                 cwd=self.view.scratch_parent(),
