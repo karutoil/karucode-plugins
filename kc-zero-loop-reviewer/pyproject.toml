@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zero-loop-reviewer"
+version = "1.0.0"
+description = "Zero-loop, high-recall CI code review plugin for karucode"
+requires-python = ">=3.11"
+dependencies = ["pydantic>=2.6", "httpx>=0.27"]
+
+[project.scripts]
+zero-loop-reviewer = "zero_loop_reviewer.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["zero_loop_reviewer*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "integration: needs a real external tool (podman, semgrep, git)",
+    "network: opens a loopback HTTP socket",
+]
+filterwarnings = ["error::DeprecationWarning:zero_loop_reviewer.*"]

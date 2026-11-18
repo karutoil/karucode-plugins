@@ -1,0 +1,9 @@
+#!/bin/sh
+# karucode spawns this file as the plugin process. It only sets PYTHONPATH so
+# the package can be imported from wherever the plugin directory was installed.
+set -eu
+here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+root=$(dirname "$here")
+PYTHONPATH="$root${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH
+exec python3 -m zero_loop_reviewer "$@"

@@ -1,0 +1,46 @@
+{
+  "rules": [
+    {
+      "id": "zero-loop.subprocess-shell-true",
+      "track": "taint",
+      "cwe": "CWE-78",
+      "severity": 3
+    },
+    {
+      "id": "zero-loop.eval-exec",
+      "track": "taint",
+      "cwe": "CWE-95",
+      "severity": 3
+    },
+    {
+      "id": "zero-loop.yaml-load-unsafe",
+      "track": "taint",
+      "cwe": "CWE-502",
+      "severity": 3
+    },
+    {
+      "id": "zero-loop.sql-string-concat",
+      "track": "taint",
+      "cwe": "CWE-89",
+      "severity": 3
+    },
+    {
+      "id": "zero-loop.sql-fstring-execute",
+      "track": "taint",
+      "cwe": "CWE-89",
+      "severity": 3
+    },
+    {
+      "id": "zero-loop.sql-injection-via-variable",
+      "track": "taint",
+      "cwe": "CWE-89",
+      "severity": 3
+    },
+    {
+      "id": "zero-loop.open-without-context",
+      "track": "lifetime",
+      "cwe": "CWE-772",
+      "severity": 1
+    }
+  ]
+}

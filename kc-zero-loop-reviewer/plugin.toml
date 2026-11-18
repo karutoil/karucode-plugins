@@ -1,0 +1,48 @@
+# Manifest form of the plugin registration.
+#
+# Install with `karucode plugin install ./kc-zero-loop-reviewer` (a local
+# directory is a single-plugin repository: this file is the root manifest), or
+# copy this directory to <data_dir>/plugins/zero-loop-reviewer/ and rescan with
+# POST /api/plugins/reload.
+#
+# `command` must be absolute and resolve inside the plugin directory.
+
+name = "zero-loop-reviewer"
+command = ["/home/karutoil/karucode-plugins/kc-zero-loop-reviewer/bin/zero-loop-reviewer"]
+enabled = true
+
+# Reads the repository and writes receipts/worktrees; runs git, semgrep,
+# ast-grep and podman; calls the model endpoint and the Git provider.
+permissions = ["files.read", "files.write", "shell", "network"]
+
+# Values shown here are the operator-visible defaults. The full declaration
+# (labels, ranges, help) is in the plugin's `initialize` manifest, so Settings →
+# Plugins & MCP draws the fields. Nothing here is a credential: only the *name*
+# of an environment variable is configured.
+[settings]
+model.primary = "od/deepseek-v4.1-flash"
+llm.base_url = ""
+llm.api_key_env = "ZERO_LOOP_LLM_API_KEY"
+llm.timeout_secs = 120
+review.deadline_secs = 240
+review.stage2_timeout_secs = 60
+review.max_model_tokens = 128000
+review.probe_attempts = 3
+review.max_findings = 3
+fusion.c_fr = 10
+fusion.c_fa = 1
+fusion.monitor_votes = 5
+fusion.monitor_temperature = 0.8
+fusion.disagreement_threshold = 0.55
+sandbox.runtime = "podman"
+sandbox.image = "docker.io/library/python:3.12-alpine"
+sandbox.timeout_secs = 120
+sast.semgrep_config = ""
+gate.bot_login = "zero-loop-reviewer[bot]"
+gate.require_checks = ""
+gate.require_approval = false
+gate.cross_provider_audit = true
+redaction.enabled = true
+ci.provider = "none"
+ci.token_env = "GITHUB_TOKEN"
+state.dir = ""

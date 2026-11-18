@@ -1,0 +1,236 @@
+# Rules shipped with zero-loop-reviewer (Stage 2A).
+#
+# Every rule is deliberately narrow and syntactic: the reviewer's job is to
+# report *patch-caused* signals with an exact file/line trace, not to replace a
+# project's own Semgrep configuration.  Metadata carries the CWE (read back by
+# ``stage2.sast``) and the track the CPG projection should use
+# (``stage2.cpg`` reads ``rules/policy.json``, not this file).
+rules:
+  - id: zero-loop.subprocess-shell-true
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Command execution with shell=True: the command string is interpreted by a
+      shell, so any interpolated value is a command-injection sink (CWE-78).
+    metadata:
+      category: security
+      confidence: HIGH
+      cwe: "CWE-78: Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"
+      zero_loop_track: taint
+    patterns:
+      - pattern: subprocess.$FUNC(..., shell=True, ...)
+
+  - id: zero-loop.eval-exec
+    languages: [python]
+    severity: ERROR
+    message: >-
+      eval/exec of an expression: code passed to this call runs as Python, which
+      is code injection when any part of it is attacker-influenced (CWE-95).
+    metadata:
+      category: security
+      confidence: HIGH
+      cwe: "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code ('Eval Injection')"
+      zero_loop_track: taint
+    patterns:
+      - pattern-either:
+          - pattern: eval(...)
+          - pattern: exec(...)
+
+  - id: zero-loop.yaml-load-unsafe
+    languages: [python]
+    severity: ERROR
+    message: >-
+      yaml.load without SafeLoader: the document can instantiate arbitrary
+      Python objects (CWE-502). Use yaml.safe_load or Loader=yaml.SafeLoader.
+    metadata:
+      category: security
+      confidence: HIGH
+      cwe: "CWE-502: Deserialization of Untrusted Data"
+      zero_loop_track: taint
+    patterns:
+      - pattern-either:
+          - pattern: yaml.load($DATA)
+          - pattern: yaml.load($DATA, ...)
+      - pattern-not: yaml.load($DATA, Loader=yaml.SafeLoader, ...)
+      - pattern-not: yaml.load($DATA, Loader=SafeLoader, ...)
+      - pattern-not: yaml.load($DATA, Loader=yaml.CSafeLoader, ...)
+      - pattern-not: yaml.load($DATA, Loader=CSafeLoader, ...)
+      - pattern-not: yaml.load($DATA, yaml.SafeLoader, ...)
+      - pattern-not: yaml.load($DATA, SafeLoader, ...)
+      - pattern-not: yaml.load($DATA, yaml.CSafeLoader, ...)
+      - pattern-not: yaml.load($DATA, CSafeLoader, ...)
+
+  - id: zero-loop.hardcoded-password
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Hardcoded credential: a password/token literal in source is a shared
+      secret that cannot be rotated (CWE-798). Read it from the environment or a
+      secret store instead.
+    metadata:
+      category: security
+      confidence: MEDIUM
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      zero_loop_track: taint
+    patterns:
+      - pattern-either:
+          - pattern: $VAR = "$SECRET"
+          - pattern: '$VAR: str = "$SECRET"'
+      - metavariable-regex:
+          metavariable: $VAR
+          regex: (?i)^(password|passwd|pwd|secret|api_key|apikey|token|auth_token|access_token|private_key|client_secret)$
+      - metavariable-regex:
+          metavariable: $SECRET
+          regex: .{4,}
+
+  - id: zero-loop.hardcoded-password-attribute
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Hardcoded credential assigned to an attribute: a password/token literal in
+      source is a shared secret that cannot be rotated (CWE-798).
+    metadata:
+      category: security
+      confidence: MEDIUM
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      zero_loop_track: taint
+    patterns:
+      - pattern-either:
+          - pattern: self.$ATTR = "$SECRET"
+          - pattern: $OBJ.$ATTR = "$SECRET"
+      - metavariable-regex:
+          metavariable: $ATTR
+          regex: (?i)^(password|passwd|pwd|secret|api_key|apikey|token|auth_token|access_token|private_key|client_secret)$
+      - metavariable-regex:
+          metavariable: $SECRET
+          regex: .{4,}
+
+  - id: zero-loop.hardcoded-password-literal
+    languages: [python]
+    severity: WARNING
+    message: >-
+      Hardcoded credential literal: a password passed as a default, keyword
+      argument or dict entry is a shared secret that cannot be rotated
+      (CWE-798).
+    metadata:
+      category: security
+      confidence: MEDIUM
+      cwe: "CWE-798: Use of Hard-coded Credentials"
+      zero_loop_track: taint
+    patterns:
+      - pattern-either:
+          - pattern: $FUNC(..., password="$SECRET", ...)
+          - pattern: $FUNC(..., passwd="$SECRET", ...)
+          - pattern: |
+              def $FN(..., password="$SECRET", ...):
+                  ...
+          - pattern: |
+              def $FN(..., passwd="$SECRET", ...):
+                  ...
+          - pattern: '{"password": "$SECRET", ...}'
+          - pattern: '{..., "password": "$SECRET", ...}'
+      - metavariable-regex:
+          metavariable: $SECRET
+          regex: .{4,}
+
+  - id: zero-loop.weak-hash-md5
+    languages: [python]
+    severity: WARNING
+    message: >-
+      MD5 is cryptographically broken; a password or integrity digest computed
+      with it can be forged (CWE-328). Use hashlib.sha256 or a password KDF.
+    metadata:
+      category: security
+      confidence: HIGH
+      cwe: "CWE-328: Use of Weak Hash"
+      zero_loop_track: lifetime
+    patterns:
+      - pattern-either:
+          - pattern: hashlib.md5(...)
+          - pattern: hashlib.new("md5", ...)
+          - pattern: hashlib.new('md5', ...)
+
+  - id: zero-loop.sql-string-concat
+    languages: [python]
+    severity: ERROR
+    message: >-
+      SQL statement built by string concatenation/formatting and passed straight
+      to execute(): an interpolated value changes the query (CWE-89). Use bound
+      parameters.
+    metadata:
+      category: security
+      confidence: HIGH
+      cwe: "CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"
+      zero_loop_track: taint
+    patterns:
+      - pattern-either:
+          - pattern: $DB.execute($Q + $X, ...)
+          - pattern: $DB.executemany($Q + $X, ...)
+          - pattern: $DB.execute($Q % $V, ...)
+          - pattern: $DB.execute($Q.format(...), ...)
+          - pattern: $DB.executemany($Q % $V, ...)
+          - pattern: $DB.executemany($Q.format(...), ...)
+      - metavariable-regex:
+          metavariable: $Q
+          regex: (?i).*(select|insert|update|delete|from\s|where\s).*
+
+  - id: zero-loop.sql-injection-via-variable
+    languages: [python]
+    severity: ERROR
+    message: >-
+      A SQL statement built with interpolation is stored in a variable and later
+      executed: an untrusted value changes the query (CWE-89). Use bound
+      parameters.
+    metadata:
+      category: security
+      confidence: HIGH
+      cwe: "CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"
+      zero_loop_track: taint
+    patterns:
+      - pattern-either:
+          - pattern: |
+              $Q = f"..."
+              ...
+              $DB.execute($Q, ...)
+          - pattern: |
+              $Q = "..." + $X
+              ...
+              $DB.execute($Q, ...)
+          - pattern: |
+              $Q = "..." % $X
+              ...
+              $DB.execute($Q, ...)
+          - pattern: |
+              $Q = "...".format(...)
+              ...
+              $DB.execute($Q, ...)
+
+  - id: zero-loop.open-without-context
+    languages: [python]
+    severity: WARNING
+    message: >-
+      File handle opened outside a with-statement: every return/exception path
+      that skips close() leaks the descriptor (CWE-772). Use `with open(...)`.
+    metadata:
+      category: quality
+      confidence: LOW
+      cwe: "CWE-772: Missing Release of Resource after Effective Lifetime"
+      zero_loop_track: lifetime
+    patterns:
+      - pattern: $F = open(...)
+
+  - id: zero-loop.sql-fstring-execute
+    languages: [python]
+    severity: ERROR
+    message: >-
+      SQL statement built with an f-string and passed straight to execute()
+      (CWE-89). Use bound parameters.
+    metadata:
+      category: security
+      confidence: MEDIUM
+      cwe: "CWE-89: Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"
+      zero_loop_track: taint
+    patterns:
+      - pattern-either:
+          - pattern: $DB.execute(f"...", ...)
+          - pattern: $DB.executemany(f"...", ...)
