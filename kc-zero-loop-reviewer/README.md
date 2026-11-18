@@ -284,8 +284,9 @@ loopback and put a TLS reverse proxy in front.
 
 `./check.sh` runs everything below. On this machine:
 
-* **458 tests pass** in about 67 s (real git 2.47.3, real Semgrep 1.173.0,
-  real podman 5.4.2, a real OpenAI-compatible HTTP fake for the client tests).
+* **458 tests** in about 60–67 s (real git 2.47.3, real Semgrep 1.173.0,
+  real podman 5.4.2, a real OpenAI-compatible HTTP fake for the client tests);
+  four podman-image tests skip when no image can run pytest.
 * `python3 eval/run_eval.py` on the annotated corpus: **6/6 buggy cases
   intercepted, 0/4 clean or fix-confirming cases flagged**, in 33.8 s for all
   ten cases.
