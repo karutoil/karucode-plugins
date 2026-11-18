@@ -73,3 +73,11 @@ def test_context_and_output_defaults_are_500k_and_64k() -> None:
 def test_output_tokens_can_be_configured_without_a_host_setting() -> None:
     settings = load_settings({"model.max_tokens": 32_000}, {})
     assert settings.llm.security.max_tokens == 32_000
+
+
+def test_decomposition_and_exhaustive_are_real_booleans() -> None:
+    from zero_loop_reviewer.config import load_settings
+
+    settings = load_settings({"review.decomposition": False, "review.exhaustive": "false"}, {})
+    assert settings.decomposition is False
+    assert settings.exhaustive is False

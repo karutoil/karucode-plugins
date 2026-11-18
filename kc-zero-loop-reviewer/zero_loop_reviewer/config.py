@@ -458,6 +458,7 @@ class Settings:
     )
     max_model_tokens: int = 500_000
     exhaustive: bool = True
+    decomposition: bool = True
     deadline_s: float = 240.0
     stage2_timeout_s: float = 60.0
     probe_attempts: int = 3
@@ -538,6 +539,8 @@ def _env_key(key: str) -> str:
 
 def _coerce(key: str, raw: Any, declaration: dict[str, Any] | None) -> Any:
     kind = (declaration or {}).get("type", "text")
+    if declaration is None and key in {"review.exhaustive", "review.decomposition"}:
+        kind = "bool"
     if kind == "bool":
         if isinstance(raw, bool):
             return raw
@@ -598,6 +601,7 @@ def _merged(settings: Mapping[str, Any], environ: Mapping[str, str], file_values
         "llm.max_retries",
         "llm.response_format",
         "review.exhaustive",
+        "review.decomposition",
         "model.reasoning_effort",
         "model.triage_reasoning_effort",
         "model.security_reasoning_effort",
@@ -799,6 +803,7 @@ def load_settings(
         paths=paths,
         max_model_tokens=int(get("review.max_model_tokens", 500_000)),
         exhaustive=bool(get("review.exhaustive", True)),
+        decomposition=bool(get("review.decomposition", True)),
         deadline_s=float(get("review.deadline_secs", 240)),
         stage2_timeout_s=float(get("review.stage2_timeout_secs", 60)),
         probe_attempts=max(1, min(3, int(get("review.probe_attempts", 3)))),

@@ -172,7 +172,7 @@ non-loopback bind without a secret is refused. The secret variable is
 
 `./check.sh` runs everything below. On this machine:
 
-* **440 tests pass** (real git, real Semgrep 1.173.0, real podman 5.4.2,
+* **444 tests pass** (real git, real Semgrep 1.173.0, real podman 5.4.2,
   a real OpenAI-compatible HTTP fake for the client tests).
 * `python3 eval/run_eval.py` on the annotated corpus: **6/6 buggy cases
   intercepted, 0/4 clean or fix-confirming cases flagged**, in ~33 s for all ten cases.
@@ -214,13 +214,47 @@ verified finding or reports `human_review`.
 
 The diff is read up to an 8 MB safety ceiling and the context assembler may use
 up to **500k tokens**; the model output ceiling is **64k tokens**. Behavioural
-review is file-ranked and batched: up to 24 batches of 4 source files / 30k
-characters, four batches in flight at once. Large files are split at hunk
-boundaries; a file with one enormous hunk is a declared blind spot unless it is
-a test file. Semgrep scans the complete changed-file set in chunks of at most
-200 paths, and up to 24 hypotheses reach the probe/CIVER stages, which are
-capped at 32 each. Every verified finding is published up to the safety ceiling
-of 50; `review.max_findings` can impose a lower explicit cap.
+review is semantically batched: up to 100 size-bounded batches of 4 source
+files / 30k characters, four in flight at once, and a batch never mixes two
+change units. Large files are split at hunk boundaries; a file with one
+enormous hunk is a declared blind spot unless it is a test file. Semgrep scans
+the complete changed-file set in chunks of at most 200 paths, and up to 24
+hypotheses reach the probe/CIVER stages, which are capped at 32 each. Every
+verified finding is published up to the safety ceiling of 50;
+`review.max_findings` can impose a lower explicit cap.
+
+### Change-graph decomposition
+
+`review.decomposition = true` (the default; TOML/env) builds a deterministic file graph
+from changed-file imports, test/source pairing and feature-directory affinity.
+Connected components become **change units** (capped at 12 files per unit,
+split by feature when larger). Each behavioural batch carries its unit's title,
+files and cross-unit edges; batches remain size-bounded, so this changes the
+routing, not the transport.
+
+When the graph has cross-unit edges, one **integration pass** reviews the
+boundaries as well: changed signatures/contracts, API ↔ client, schema ↔
+migration, shared types, feature flags and contradictory changes between units.
+If the integration call fails, the result is a human-review blind spot, not an
+approval. If the graph is empty or unusable, the current file-ranked batching
+is the fallback.
+
+On the 268-line test commit the current plan used 3 batches and 255 s; the
+decomposed plan used 5 semantic batches and 118 s, with the same coverage
+(151/151 lines) and the same 0 verified findings. That is a latency/locality
+result, not evidence of better recall. A synthetic cross-file bug — a backend
+response key renamed while a frontend consumer still indexed the old key — was
+grouped into one unit, caught by the reproduction probe and published with a
+verified patch in 60 s (2/2 changed lines covered). On the 9.6k-line PR #17 the
+graph produced 21 units and 19 cross-unit edges, 29 batches, and still covered
+6,492/6,492 production changed lines.
+
+A second synthetic 14-file PR split one connected component into two units and
+exercised the integration pass. The current file-batched mode published 1
+finding in 101 s; the graph mode published **2** in 135 s, including the actual
+`KeyError` in the consumer unit that the current mode missed, with 14/14 lines
+covered in both. That is the first quality signal for the combined design, on a
+small synthetic case rather than a labelled production corpus.
 
 A 1,000–2,000 line PR usually takes one to three model calls. A 9k-line,
 83-file PR is about 24 calls and can legitimately take 20–40 minutes; the

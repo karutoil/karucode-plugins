@@ -203,16 +203,43 @@ Rules:
 # --------------------------------------------------------------------------- #
 
 
+def integration_prompt(
+    diff: DiffBundle,
+    context: ContextSlice,
+    *,
+    edges: list[tuple[str, str]],
+    unit_notes: list[str],
+) -> Prompt:
+    """One whole-PR pass over the boundaries between change units."""
+    user = _join(
+        _schema("BehavioralCandidates", BehavioralCandidates),
+        _evidence("cross_unit_edges", edges, 8000),
+        _evidence("change_units", unit_notes, 12000),
+        _evidence("changed_code", _diff_digest(diff), 120000),
+        _evidence("one_hop_context", context.text, 120000),
+        """Task: review the BOUNDARIES between the change units above.
+Look for a changed return/parameter contract a caller in another unit cannot satisfy, a schema/migration mismatch, a shared type changed on one side only, an API response the client no longer matches, a feature flag enabling code before its dependency, or two units making contradictory changes.
+Rules:
+- Cite only changed files and lines that appear above.
+- A unit-internal issue is not an integration issue; focus on what crosses a unit boundary.
+- Do not report naming, formatting, missing tests, or refactoring advice.
+- If the boundaries are consistent, return an empty list.""",
+    )
+    return Prompt(stage="integration", system=SYSTEM, user=user, schema_name="BehavioralCandidates")
+
+
 def behavioral_prompt(
     diff: DiffBundle,
     context: ContextSlice,
     *,
     plan: TriagePlan | None = None,
+    unit_note: str = "",
 ) -> Prompt:
     user = _join(
         _schema("BehavioralCandidates", BehavioralCandidates),
         _evidence("changed_code", _diff_digest(diff), 120000),
         _evidence("one_hop_context", context.text, 120000),
+        _evidence("change_unit", unit_note, 4000),
         _evidence("risk_hypotheses", plan.risk_hypotheses if plan else [], 4000),
         """Task: name at most three behavioural defects a reproduction test could demonstrate in the CHANGED lines.
 Look for: wrong boundary arithmetic, missing None/empty handling, an error path that skips cleanup, a state transition left inconsistent, a changed return contract its callers cannot satisfy, a guard that no longer covers a new branch.

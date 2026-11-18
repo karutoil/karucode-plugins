@@ -19,7 +19,7 @@ from .config import Settings, StageModel, ensure_state_dirs
 from .errors import ContractViolation, LLMError, ReviewError
 from .gitops import GitError, GitRepo
 from .llm.client import JSONLLM, NullLLM, OpenAICompatibleClient, build_llm
-from .llm.prompts import behavioral_prompt, triage_prompt
+from .llm.prompts import behavioral_prompt, integration_prompt, triage_prompt
 from .models import (
     AnalyzerFinding,
     AttemptStatus,
@@ -57,6 +57,7 @@ from .providers.base import GitProvider
 from .stage1 import context as context_mod
 from .stage1 import pmi as pmi_mod
 from .stage1.contract import ContractReport, enforce_contract, run_bounded
+from .stage1.changegraph import ChangePlan, build_change_plan
 from .stage1.gatekeeper import HeadCommitGate
 from .stage1.receipts import Clock, ReceiptLog
 from .stage2 import cpg as cpg_mod
@@ -148,6 +149,7 @@ class _Run:
     diff: DiffBundle | None = None
     context: ContextSlice | None = None
     stage2: Stage2Outcome | None = None
+    change_plan: ChangePlan | None = None
     coverage_total: int = 0
     coverage_covered: int = 0
 
@@ -381,6 +383,18 @@ class Reviewer:
             run.degraded.append(f"diff_failed: {exc}")
             return self._finish(review_id, request, repo, head_sha, run, budget, force_human=True)
         run.diff = diff
+        if self.settings.decomposition:
+            try:
+                run.change_plan = build_change_plan(repo, diff)
+                self._record(
+                    "1.change_graph",
+                    AttemptStatus.COMPLETED,
+                    _now(),
+                    f"{run.change_plan.summary()['units']} unit(s), "
+                    f"{run.change_plan.summary()['edges']} cross-unit edge(s)",
+                )
+            except Exception as exc:
+                run.degraded.append(f"change_graph_degraded: {type(exc).__name__}: {exc}")
 
         # ---- Stage 1: context, triage, PR-MCI -------------------------------
         started = _now()
@@ -501,6 +515,7 @@ class Reviewer:
                     "behavioral_coverage_incomplete",
                     "behavioral_candidate_coverage_incomplete",
                     "behavioral_hunk_coverage_incomplete",
+                    "integration_scan_degraded",
                     "probe_coverage_incomplete",
                     "civer_coverage_incomplete",
                     "context_truncated",
@@ -547,6 +562,7 @@ class Reviewer:
                 if self.settings.exhaustive
                 else MAX_BEHAVIOR_BATCHES
             ),
+            plan=run.change_plan,
         )
         if not batches:
             return []
@@ -576,13 +592,57 @@ class Reviewer:
         def run_batch(index: int, batch: list[FilePatch]) -> tuple[int, list[Any]]:
             batch_diff = diff.model_copy(update={"files": batch})
             batch_context = _context_for_batch(context, {patch.path for patch in batch})
+            unit = run.change_plan.unit_for(batch[0].path) if run.change_plan is not None else None
+            unit_note = ""
+            if unit is not None:
+                unit_note = (
+                    f"{unit.title}\n"
+                    f"unit id: {unit.id}\n"
+                    f"files: {', '.join(unit.paths)}\n"
+                    f"cross-unit edges: {', '.join(unit.related) or 'none'}"
+                )
             answer = self.llm.complete(
                 "behavioral",
-                behavioral_prompt(batch_diff, batch_context, plan=plan),
+                behavioral_prompt(batch_diff, batch_context, plan=plan, unit_note=unit_note),
                 BehavioralCandidates,
                 stage_model=self.settings.llm.reviewer,
             )
             return index, list(answer.value.candidates)
+
+        def accept(drafts: Sequence[Any], scope: DiffBundle) -> None:
+            nonlocal rejected, over_cap
+            for draft in drafts:
+                sites = [
+                    site
+                    for site in draft.cited_sites
+                    if _site_in_diff(scope, site) and _groundable(site, analyzer_findings)
+                ]
+                if not sites:
+                    rejected += 1
+                    continue
+                if len(kept) >= max_candidates:
+                    over_cap += 1
+                    continue
+                trigger = f" Trigger: {draft.suspected_trigger}" if draft.suspected_trigger else ""
+                candidate = Candidate(
+                    id=_candidate_id("3", sites[0].path, sites[0].line, draft.title),
+                    stage=StageId.PROBE,
+                    category=draft.category,
+                    title=draft.title,
+                    root_cause=(draft.root_cause + trigger)[:4000],
+                    severity=_severity(draft.severity),
+                    cited_sites=sites,
+                    evidence=Evidence(
+                        kind="llm_hypothesis",
+                        analyzer="behavioral-scan",
+                        trace=sites,
+                        detail="a grounded hypothesis; it becomes a finding only after mechanical verification",
+                    ),
+                )
+                if candidate.id in seen:
+                    continue
+                seen.add(candidate.id)
+                kept.append(candidate)
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
@@ -610,44 +670,55 @@ class Reviewer:
                         "2.behavioral.batch", AttemptStatus.PROCESS_CRASH, started, f"batch {index}: {exc}"
                     )
                     continue
-                for draft in drafts:
-                    sites = [
-                        site
-                        for site in draft.cited_sites
-                        if _site_in_diff(batch_diff, site) and _groundable(site, analyzer_findings)
-                    ]
-                    if not sites:
-                        rejected += 1
-                        continue
-                    if len(kept) >= max_candidates:
-                        over_cap += 1
-                        continue
-                    trigger = f" Trigger: {draft.suspected_trigger}" if draft.suspected_trigger else ""
-                    candidate = Candidate(
-                        id=_candidate_id("3", sites[0].path, sites[0].line, draft.title),
-                        stage=StageId.PROBE,
-                        category=draft.category,
-                        title=draft.title,
-                        root_cause=(draft.root_cause + trigger)[:4000],
-                        severity=_severity(draft.severity),
-                        cited_sites=sites,
-                        evidence=Evidence(
-                            kind="llm_hypothesis",
-                            analyzer="behavioral-scan",
-                            trace=sites,
-                            detail="a grounded hypothesis; it becomes a finding only after mechanical verification",
-                        ),
-                    )
-                    if candidate.id in seen:
-                        continue
-                    seen.add(candidate.id)
-                    kept.append(candidate)
+                accept(drafts, batch_diff)
                 self._record(
                     "2.behavioral.batch",
                     AttemptStatus.COMPLETED,
                     started,
                     f"batch {index}/{len(batches)}: {len(drafts)} draft(s), {len(kept)} kept so far",
                 )
+        if (
+            run.change_plan is not None
+            and len(run.change_plan.units) > 1
+            and run.change_plan.edges
+            and budget.remaining() > 30.0
+        ):
+            self._cap_llm(budget)
+            notes = [
+                f"{unit.id} | {unit.title} | files: {', '.join(unit.paths)}"
+                for unit in run.change_plan.units
+            ]
+            try:
+                answer = self.llm.complete(
+                    "integration",
+                    integration_prompt(
+                        diff,
+                        context,
+                        edges=run.change_plan.edges,
+                        unit_notes=notes,
+                    ),
+                    BehavioralCandidates,
+                    stage_model=self.settings.llm.reviewer,
+                )
+                integration_drafts = list(answer.value.candidates)
+                accept(integration_drafts, diff)
+                self._record(
+                    "2.integration",
+                    AttemptStatus.COMPLETED,
+                    started,
+                    f"{len(integration_drafts)} boundary draft(s), "
+                    f"{len(run.change_plan.edges)} edge(s)",
+                )
+            except LLMError as exc:
+                run.degraded.append(
+                    f"integration_scan_degraded: {exc.kind.value}: {exc.message}"
+                )
+                self._record("2.integration", exc.kind, started, exc.message)
+            except Exception as exc:
+                run.degraded.append(
+                    f"integration_scan_degraded: {type(exc).__name__}: {exc}"
+                )
+                self._record("2.integration", AttemptStatus.PROCESS_CRASH, started, str(exc))
         self._record(
             "2.behavioral",
             AttemptStatus.COMPLETED if not failed else AttemptStatus.SKIPPED,
@@ -1668,43 +1739,73 @@ def _behavioral_batches(
     diff: DiffBundle,
     *,
     max_batches: int = MAX_BEHAVIOR_BATCHES,
+    plan: ChangePlan | None = None,
 ) -> tuple[list[list[FilePatch]], bool, bool]:
-    """Rank changed source files and group them into evidence-sized batches."""
+    """Rank changed source files and group them into evidence-sized batches.
+
+    When a change plan is available, batches never cross a semantic unit: a
+    feature's API, implementation and tests stay in the same prompt even when
+    they are split over several size-bounded batches.
+    """
     files = sorted(
         (patch for patch in diff.files if _behavioral_eligible(patch)),
         key=lambda patch: (-_behavioral_weight(patch), patch.path),
     )
     if not files:
         return [], False, False
-    units: list[FilePatch] = []
-    oversized = False
-    for patch in files:
-        if len(patch.patch_text()) <= MAX_BEHAVIOR_BATCH_CHARS:
-            units.append(patch)
-            continue
-        split, unsplittable = _split_large_patch(patch)
-        if unsplittable and _is_test_path(patch.path):
-            # A generated test fixture with one enormous hunk is not worth a
-            # human review by itself; the rule packs still scan it.
-            continue
-        units.extend(split)
-        oversized = oversized or unsplittable
-    batches: list[list[FilePatch]] = []
-    current: list[FilePatch] = []
-    chars = 0
-    for patch in units:
-        size = len(patch.patch_text())
-        if current and (
-            chars + size > MAX_BEHAVIOR_BATCH_CHARS
-            or len(current) >= MAX_BEHAVIOR_FILES_PER_BATCH
-        ):
+
+    def split(files: list[FilePatch]) -> tuple[list[FilePatch], bool]:
+        units: list[FilePatch] = []
+        oversized = False
+        for patch in files:
+            if len(patch.patch_text()) <= MAX_BEHAVIOR_BATCH_CHARS:
+                units.append(patch)
+                continue
+            pieces, unsplittable = _split_large_patch(patch)
+            if unsplittable and _is_test_path(patch.path):
+                continue
+            units.extend(pieces)
+            oversized = oversized or unsplittable
+        return units, oversized
+
+    def chunk(units: list[FilePatch]) -> list[list[FilePatch]]:
+        batches: list[list[FilePatch]] = []
+        current: list[FilePatch] = []
+        chars = 0
+        for patch in units:
+            size = len(patch.patch_text())
+            if current and (
+                chars + size > MAX_BEHAVIOR_BATCH_CHARS
+                or len(current) >= MAX_BEHAVIOR_FILES_PER_BATCH
+            ):
+                batches.append(current)
+                current = []
+                chars = 0
+            current.append(patch)
+            chars += size
+        if current:
             batches.append(current)
-            current = []
-            chars = 0
-        current.append(patch)
-        chars += size
-    if current:
-        batches.append(current)
+        return batches
+
+    batches: list[list[FilePatch]] = []
+    oversized = False
+    assigned: set[str] = set()
+    if plan is not None and plan.units:
+        by_path = {patch.path: patch for patch in files}
+        for unit in plan.units:
+            unit_files = [by_path[path] for path in unit.paths if path in by_path]
+            if not unit_files:
+                continue
+            assigned.update(patch.path for patch in unit_files)
+            pieces, unsplittable = split(unit_files)
+            oversized = oversized or unsplittable
+            batches.extend(chunk(pieces))
+    # A file the graph did not know about still gets reviewed.
+    leftovers = [patch for patch in files if patch.path not in assigned]
+    if leftovers:
+        pieces, unsplittable = split(leftovers)
+        oversized = oversized or unsplittable
+        batches.extend(chunk(pieces))
     capped = len(batches) > max_batches
     return batches[:max_batches], capped, oversized
 

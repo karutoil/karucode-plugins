@@ -130,9 +130,11 @@ git provider / CI job / karucode tool call
                 ▼
  stage 1  RuntimeContract ── receipts ── HeadCommitGate ── PR-MCI isolation
           ContextSlicer (1-hop symbols, conventions, DesignLore, 500k budget)
+          ChangeGraph: imports/tests/directories → units + cross-unit edges
                 │
                 ▼
  stage 2  parallel executor (asyncio, ≤60 s)
+          unit-aware behavioural batches ── cross-unit integration pass
           2A Semgrep/SAST delta ── patch-caused filter
           2B secSemScan monologue ── fresh line reconciliation ── CPG frames
           2C RALE: (AST && CFG) || Code
