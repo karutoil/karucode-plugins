@@ -322,6 +322,12 @@ def probe_script(
         )
         command = (
             "export CARGO_TARGET_DIR=/tmp/zl-target\n"
+            # The official image puts rustup proxies on PATH.  With a read-only
+            # root, a proxy with no default toolchain tries to sync and fails;
+            # select the installed toolchain directly when it exists.
+            "for d in /usr/local/rustup/toolchains/*/bin; do\n"
+            '  if [ -x "$d/cargo" ]; then PATH="$d:$PATH"; break; fi\n'
+            "done\n"
             f"cd {PROBE_ROOT}/{crate}\n"
             f"cargo test --offline --test {stem} -- --nocapture"
         )

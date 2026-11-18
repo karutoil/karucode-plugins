@@ -194,7 +194,8 @@ def probe_prompt(
         ),
         "typescript": (
             "One TypeScript/JavaScript test file using `node:test` and `node:assert` or `expect`. "
-            "Use `framework: node` for .js/.mjs or `framework: tsx` for .ts/.tsx. "
+            "Use `framework: node` for .ts/.tsx/.js/.mjs; Node 22 strips TypeScript types. "
+            "Use `tsx` only if the project already has tsx installed, never npx/network. "
             "Do not add dependencies or use the network."
         ),
         "javascript": (
