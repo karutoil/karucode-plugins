@@ -596,6 +596,7 @@ def _merged(settings: Mapping[str, Any], environ: Mapping[str, str], file_values
         "fusion.clip",
         "llm.max_retries",
         "llm.response_format",
+        "model.reasoning_effort",
         "sast.enabled",
         "sast.semgrep_bin",
         "sast.timeout_secs",
@@ -649,7 +650,13 @@ def load_settings(
         return fallback
 
     primary_model = str(get("model.primary") or DEFAULT_MODEL)
-    primary = StageModel(model=primary_model, temperature=0.0)
+    # A reasoning model asked for a JSON contract will spend most of the CI
+    # budget thinking unless the effort is bounded.  "low" keeps DeepSeek
+    # V4.1-Flash's answer shape stable and its latency under a few seconds;
+    # operators can raise it in TOML/env without a code change.
+    effort_raw = str(get("model.reasoning_effort", "low") or "").strip().lower()
+    reasoning_effort = effort_raw if effort_raw in ("none", "minimal", "low", "medium", "high") else None
+    primary = StageModel(model=primary_model, temperature=0.0, reasoning_effort=reasoning_effort)
     monitor_votes = int(get("fusion.monitor_votes", 5))
     monitor_temp = float(get("fusion.monitor_temperature", 0.8))
 
@@ -660,20 +667,22 @@ def load_settings(
         max_retries=int(get("llm.max_retries", 2)),
         response_format=bool(get("llm.response_format", True)),
         primary=primary,
-        triage=StageModel(model=str(get("model.triage") or primary_model), temperature=0.0),
-        security=StageModel(model=str(get("model.security") or primary_model), temperature=0.0),
-        probe=StageModel(model=str(get("model.probe") or primary_model), temperature=0.2),
-        reviewer=StageModel(model=str(get("model.reviewer") or primary_model), temperature=0.0),
+        triage=StageModel(model=str(get("model.triage") or primary_model), temperature=0.0, reasoning_effort=reasoning_effort),
+        security=StageModel(model=str(get("model.security") or primary_model), temperature=0.0, reasoning_effort=reasoning_effort),
+        probe=StageModel(model=str(get("model.probe") or primary_model), temperature=0.2, reasoning_effort=reasoning_effort),
+        reviewer=StageModel(model=str(get("model.reviewer") or primary_model), temperature=0.0, reasoning_effort=reasoning_effort),
         monitor=StageModel(
             model=str(get("model.monitor") or primary_model),
             temperature=monitor_temp,
             votes=monitor_votes,
+            reasoning_effort=reasoning_effort,
         ),
         monitor_alt=(
             StageModel(
                 model=str(get("model.monitor_alt")),
                 temperature=monitor_temp,
                 votes=monitor_votes,
+                reasoning_effort=reasoning_effort,
             )
             if get("model.monitor_alt")
             else None

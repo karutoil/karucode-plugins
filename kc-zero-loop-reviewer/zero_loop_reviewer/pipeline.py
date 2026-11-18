@@ -444,7 +444,7 @@ class Reviewer:
                 *run.stage2.candidates,
                 *_analyzer_candidates(run.stage2.findings),
                 *_rale_candidates(run.stage2.rale),
-                *self._behavioral_candidates(diff, run.context, plan, budget, run),
+                *self._behavioral_candidates(diff, run.context, plan, budget, run, run.stage2.findings),
             ]
         )
 
@@ -488,6 +488,7 @@ class Reviewer:
         plan: TriagePlan | None,
         budget: Budget,
         run: _Run,
+        analyzer_findings: Sequence[AnalyzerFinding] = (),
     ) -> list[Candidate]:
         """Ask for grounded behavioural hypotheses; keep only diff-anchored ones.
 
@@ -516,7 +517,11 @@ class Reviewer:
         kept: list[Candidate] = []
         rejected = 0
         for draft in drafts:
-            sites = [site for site in draft.cited_sites if _site_in_diff(diff, site)]
+            sites = [
+                site
+                for site in draft.cited_sites
+                if _site_in_diff(diff, site) and _groundable(site, analyzer_findings)
+            ]
             if not sites:
                 rejected += 1
                 continue
@@ -1254,6 +1259,25 @@ def _site_in_diff(diff: DiffBundle, site: CitedSite) -> bool:
     if not changed:
         return False
     return any(abs(site.line - line) <= 2 for line in changed)
+
+
+def _groundable(site: CitedSite, findings: Sequence[AnalyzerFinding]) -> bool:
+    """Whether the stack can *test* a hypothesis about this site.
+
+    Stage 3 can execute a Python probe; a rule finding can be rerun for any
+    language.  A behavioural guess about YAML, Markdown or a Rust file with no
+    firing rule has no mechanical falsifier, so it must not become a candidate:
+    otherwise every clean docs/workflow PR ends in an unverified human review.
+    """
+    if site.path.endswith((".py", ".pyi")):
+        return True
+    return any(
+        finding.path == site.path
+        and finding.patch_caused
+        and not finding.suppressed
+        and abs(finding.line - site.line) <= 3
+        for finding in findings
+    )
 
 
 def _language(path: str) -> str:

@@ -48,3 +48,12 @@ def test_a_binary_blob_does_not_crash_a_symbol_scan(tmp_path) -> None:
     assert isinstance(text, str)  # replacement characters, never a UnicodeDecodeError
     files = repo.list_files(sha)
     assert "assets/logo.png" in files
+
+
+def test_reasoning_effort_defaults_low_and_is_configurable() -> None:
+    settings = load_settings({}, {})
+    assert settings.llm.primary.reasoning_effort == "low"
+    assert settings.llm.reviewer.reasoning_effort == "low"
+    assert settings.llm.monitor.reasoning_effort == "low"
+    raised = load_settings({"model.reasoning_effort": "high"}, {})
+    assert raised.llm.security.reasoning_effort == "high"
