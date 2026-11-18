@@ -97,3 +97,12 @@ def test_per_language_probe_images_are_configurable() -> None:
     assert settings.sandbox.rust_image == "rust:test"
     assert settings.sandbox.node_image == "node:test"
     assert settings.sandbox.go_image == "go:test"
+
+
+def test_sandbox_extra_args_are_parsed() -> None:
+    from zero_loop_reviewer.config import load_settings
+
+    settings = load_settings(
+        {"sandbox.extra_args": "--uts=host --volume=/cargo:/usr/local/cargo:ro"}, {}
+    )
+    assert settings.sandbox.extra_args == ("--uts=host", "--volume=/cargo:/usr/local/cargo:ro")

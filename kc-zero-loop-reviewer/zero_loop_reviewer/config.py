@@ -640,6 +640,7 @@ def _merged(settings: Mapping[str, Any], environ: Mapping[str, str], file_values
         "sandbox.rust_image",
         "sandbox.node_image",
         "sandbox.go_image",
+        "sandbox.extra_args",
         "sandbox.memory_mb",
         "sandbox.cpus",
         "sandbox.pids_limit",
@@ -773,6 +774,9 @@ def load_settings(
 
     sandbox = SandboxConfig(
         runtime=str(get("sandbox.runtime", "podman")),
+        extra_args=tuple(
+            str(get("sandbox.extra_args", "--uts=host") or "--uts=host").split()
+        ),
         image=str(get("sandbox.image", "docker.io/library/python:3.12-alpine")),
         rust_image=str(get("sandbox.rust_image", "docker.io/library/rust:1.89-slim")),
         node_image=str(get("sandbox.node_image", "docker.io/library/node:22-alpine")),
