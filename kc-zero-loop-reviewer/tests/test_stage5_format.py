@@ -308,15 +308,15 @@ def test_three_identical_suggestion_ranges_merge_into_one_comment() -> None:
     assert all(f"defect c-{index}" in body for index in range(3))
 
 
-def test_render_review_has_no_threads_and_no_author_text() -> None:
+def test_render_review_has_no_threads_and_never_uses_raw_author_text() -> None:
     finding = to_finding(_candidate("c-1"), _elicitation(0.8), _monitor(0.75), 0.93, Redaction())
     payload = render_review(_verdict([finding]), bot_login="bot")
     assert payload.comments and payload.body
     assert payload.body.count("## Automated review") == 1  # one consolidated review
-    # the summary states that no author text was consulted, and quotes none
-    assert "no pull-request description" in payload.body
+    # the summary states that author text is converted to claims, not copied
+    assert "Pull-request text is read only as untrusted intent" in payload.body
+    assert "raw author text is never used as instructions" in payload.body
     assert "PR description:" not in payload.body
-    assert "author" not in payload.body.lower().replace("no pull-request description", "")
 
 
 def test_render_review_skips_an_inline_comment_for_a_redacted_finding(tmp_path) -> None:

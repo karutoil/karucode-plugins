@@ -169,7 +169,7 @@ the reason `llm_unavailable`, never an approval.
 
 `review_pr` arguments: `base` (required), `head` (default `HEAD`), `workspace`
 (defaults to the session workspace), `expected_head_sha`, `repository` +
-`pull_number`, `description` (read only by the message/code consistency check),
+`pull_number`, `description` (read only by the message/code consistency check; structured claims are forwarded)
 `stacked_branches` (branch/SHA pairs that must also pass the gate) and `post`
 (default `false`).
 
@@ -284,7 +284,7 @@ loopback and put a TLS reverse proxy in front.
 
 `./check.sh` runs everything below. On this machine:
 
-* **460 tests** in about 60–67 s (real git 2.47.3, real Semgrep 1.173.0,
+* **462 tests** in about 60–67 s (real git 2.47.3, real Semgrep 1.173.0,
   real podman 5.4.2, a real OpenAI-compatible HTTP fake for the client tests);
   four podman-image tests skip when no image can run pytest.
 * `python3 eval/run_eval.py` on the annotated corpus: **6/6 buggy cases

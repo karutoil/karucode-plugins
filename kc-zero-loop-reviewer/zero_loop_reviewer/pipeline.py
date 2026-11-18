@@ -398,6 +398,25 @@ class Reviewer:
             except Exception as exc:
                 run.degraded.append(f"change_graph_degraded: {type(exc).__name__}: {exc}")
 
+        # The description is author text: it is converted into structured,
+        # host-grounded claims here and only those claims enter the other
+        # prompts.  Raw author text never reaches a non-PMI prompt.
+        if request.description.strip():
+            started = _now()
+            try:
+                facts = pmi_mod.ast_facts(repo, diff)
+                run.mci = pmi_mod.check_consistency(request.description, facts, self.llm, settings=self.settings)
+                if run.mci.contradiction:
+                    run.degraded.append(
+                        "pr_message_inconsistency: the description claims behaviour the diff does not implement"
+                    )
+                self._record("1.pmi", AttemptStatus.COMPLETED, started, run.mci.summary or "claims checked")
+            except LLMError as exc:
+                run.degraded.append(f"pmi_degraded: {exc.kind.value}: {exc.message}")
+            except Exception as exc:
+                run.degraded.append(f"pmi_degraded: {type(exc).__name__}: {exc}")
+
+
         # ---- Stage 1: context, triage, PR-MCI -------------------------------
         started = _now()
         symbols = []
@@ -412,6 +431,7 @@ class Reviewer:
                     diff,
                     changed_symbols=[symbol.name for symbol in symbols],
                     critical_tokens=context_mod.critical_tokens(diff),
+                    claims=run.mci.claims if run.mci else (),
                 )
                 answer = self.llm.complete("triage", prompt, TriagePlan, stage_model=self.settings.llm.triage)
                 plan = answer.value
@@ -438,21 +458,6 @@ class Reviewer:
             )
         if diff.truncated:
             run.degraded.append("diff_truncated: only the first 8 MB of the patch was read")
-
-        if request.description.strip():
-            started = _now()
-            try:
-                facts = pmi_mod.ast_facts(repo, diff)
-                run.mci = pmi_mod.check_consistency(request.description, facts, self.llm, settings=self.settings)
-                if run.mci.contradiction:
-                    run.degraded.append(
-                        "pr_message_inconsistency: the description claims behaviour the diff does not implement"
-                    )
-                self._record("1.pmi", AttemptStatus.COMPLETED, started, run.mci.summary or "claims checked")
-            except LLMError as exc:
-                run.degraded.append(f"pmi_degraded: {exc.kind.value}: {exc.message}")
-            except Exception as exc:
-                run.degraded.append(f"pmi_degraded: {type(exc).__name__}: {exc}")
 
         if not diff.files:
             run.degraded.append("empty_diff: there is no code change to review")
@@ -606,7 +611,13 @@ class Reviewer:
                 )
             answer = self.llm.complete(
                 "behavioral",
-                behavioral_prompt(batch_diff, batch_context, plan=plan, unit_note=unit_note),
+                behavioral_prompt(
+                    batch_diff,
+                    batch_context,
+                    plan=plan,
+                    unit_note=unit_note,
+                    claims=run.mci.claims if run.mci else (),
+                ),
                 BehavioralCandidates,
                 stage_model=self.settings.llm.reviewer,
             )
@@ -699,6 +710,7 @@ class Reviewer:
                         context,
                         edges=run.change_plan.edges,
                         unit_notes=notes,
+                        claims=run.mci.claims if run.mci else (),
                     ),
                     BehavioralCandidates,
                     stage_model=self.settings.llm.reviewer,

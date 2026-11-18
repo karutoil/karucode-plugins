@@ -27,6 +27,7 @@ from ..models import (
     ProbeSpec,
     RiskElicitation,
     SecSemScan,
+    MciClaim,
     TriagePlan,
 )
 from .client import Prompt
@@ -106,6 +107,7 @@ def triage_prompt(
     changed_symbols: Sequence[str],
     critical_tokens: Sequence[str],
     context: ContextSlice | None = None,
+    claims: Sequence[MciClaim] = (),
 ) -> Prompt:
     user = _join(
         _schema("TriagePlan", TriagePlan),
@@ -113,6 +115,7 @@ def triage_prompt(
         _evidence("changed_symbols", list(changed_symbols)[:60], 4000),
         _evidence("critical_tokens", list(critical_tokens)[:80], 4000),
         _evidence("one_hop_context", context.text if context else "", 24000),
+        _evidence("pr_intent_claims", [claim.model_dump(mode="json") for claim in claims], 5000),
         "Task: choose the smallest set of files/functions this review must inspect, and name the "
         "symbols whose callers or definitions must be retrieved (at most 12). Then list concrete "
         "risk hypotheses that a test could falsify. Do not decide whether to approve or reject.",
@@ -248,6 +251,7 @@ def integration_prompt(
     *,
     edges: list[tuple[str, str]],
     unit_notes: list[str],
+    claims: Sequence[MciClaim] = (),
 ) -> Prompt:
     """One whole-PR pass over the boundaries between change units."""
     user = _join(
@@ -256,6 +260,7 @@ def integration_prompt(
         _evidence("change_units", unit_notes, 12000),
         _evidence("changed_code", _diff_digest(diff), 120000),
         _evidence("one_hop_context", context.text, 120000),
+        _evidence("pr_intent_claims", [claim.model_dump(mode="json") for claim in claims], 5000),
         """Task: review the BOUNDARIES between the change units above.
 Look for a changed return/parameter contract a caller in another unit cannot satisfy, a schema/migration mismatch, a shared type changed on one side only, an API response the client no longer matches, a feature flag enabling code before its dependency, or two units making contradictory changes.
 Rules:
@@ -273,6 +278,7 @@ def behavioral_prompt(
     *,
     plan: TriagePlan | None = None,
     unit_note: str = "",
+    claims: Sequence[MciClaim] = (),
 ) -> Prompt:
     user = _join(
         _schema("BehavioralCandidates", BehavioralCandidates),
@@ -280,6 +286,7 @@ def behavioral_prompt(
         _evidence("one_hop_context", context.text, 120000),
         _evidence("change_unit", unit_note, 4000),
         _evidence("risk_hypotheses", plan.risk_hypotheses if plan else [], 4000),
+        _evidence("pr_intent_claims", [claim.model_dump(mode="json") for claim in claims], 5000),
         """Task: name at most three behavioural defects a reproduction test could demonstrate in the CHANGED lines.
 Look for: wrong boundary arithmetic, missing None/empty handling, an error path that skips cleanup, a state transition left inconsistent, a changed return contract its callers cannot satisfy, a guard that no longer covers a new branch.
 Rules:

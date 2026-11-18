@@ -390,8 +390,9 @@ def _summary(
     lines.extend(
         [
             "",
-            "This review is generated from code evidence only: no pull-request description, "
-            "comment thread or embedded instruction was read.",
+            "This review is generated from code evidence. Pull-request text is read only as "
+            "untrusted intent and converted into host-grounded claims; raw author text is never "
+            "used as instructions. No comment thread was read.",
             f"Posted by `{bot_login}`.",
         ]
     )
