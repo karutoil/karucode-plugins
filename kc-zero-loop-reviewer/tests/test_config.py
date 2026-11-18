@@ -81,3 +81,19 @@ def test_decomposition_and_exhaustive_are_real_booleans() -> None:
     settings = load_settings({"review.decomposition": False, "review.exhaustive": "false"}, {})
     assert settings.decomposition is False
     assert settings.exhaustive is False
+
+
+def test_per_language_probe_images_are_configurable() -> None:
+    from zero_loop_reviewer.config import load_settings
+
+    settings = load_settings(
+        {
+            "sandbox.rust_image": "rust:test",
+            "sandbox.node_image": "node:test",
+            "sandbox.go_image": "go:test",
+        },
+        {},
+    )
+    assert settings.sandbox.rust_image == "rust:test"
+    assert settings.sandbox.node_image == "node:test"
+    assert settings.sandbox.go_image == "go:test"

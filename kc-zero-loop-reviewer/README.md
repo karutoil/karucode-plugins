@@ -143,8 +143,9 @@ Set them in `--config` TOML or as `ZERO_LOOP_*`:
 | `ci.webhook_secret_env` / `ci.webhook_port` | `ZERO_LOOP_WEBHOOK_SECRET` / `8791` | Webhook receiver |
 
 `plugin.toml` ships a `[settings]` block with the operator-visible defaults for
-a fresh install; it mirrors the declarations above and leaves the per-stage
-model overrides unset so they fall back to `model.primary`.
+a fresh install; it mirrors the declarations above (plus the three probe images,
+which are TOML/environment-only) and leaves the per-stage model overrides unset
+so they fall back to `model.primary`.
 
 ### Model endpoint
 
@@ -283,7 +284,7 @@ loopback and put a TLS reverse proxy in front.
 
 `./check.sh` runs everything below. On this machine:
 
-* **457 tests pass** in about 67 s (real git 2.47.3, real Semgrep 1.173.0,
+* **458 tests pass** in about 67 s (real git 2.47.3, real Semgrep 1.173.0,
   real podman 5.4.2, a real OpenAI-compatible HTTP fake for the client tests).
 * `python3 eval/run_eval.py` on the annotated corpus: **6/6 buggy cases
   intercepted, 0/4 clean or fix-confirming cases flagged**, in 33.8 s for all
@@ -381,6 +382,8 @@ a writable tmpfs, so the image (or the copied worktree) must carry the crate
 registry for an offline build. JavaScript/TypeScript runs `node --test`
 (`--experimental-strip-types` for `.ts`, or `npx --no-install tsx` when that
 framework is chosen) and needs the project's `node_modules` in the scratch copy.
+Go runs `go test ./<package> -run Test` and, with no network in the sandbox,
+needs the module cache or a vendored tree in the image.
 Missing toolchains, dependencies or images are **setup errors**, not evidence
 against the PR.
 
@@ -491,14 +494,14 @@ candidate cannot be verified it fails open to `human_review` with a receipt.
 ## Known limits
 
 * The executable probe path dispatches by language: Python (pytest/unittest),
-  Rust (a `tests/*.rs` integration test run with `cargo test --offline`) and
-  JavaScript/TypeScript (`node --test`, or `tsx`). A Rust probe is always an
-  integration test, so a defect that is only reachable through private internals
-  cannot be reproduced; a missing toolchain, image or dependency is a setup
-  error, which leaves the candidate unverified instead of publishing it. The
-  RALE ensemble and ObliVul's risk counter remain Python-only:
-  `rules/lsog_risk.py` parses the file with Python's `ast`, so a non-Python site
-  cannot be ObliVul-verified.
+  Rust (a `tests/*.rs` integration test run with `cargo test --offline`), Go (a
+  `*_test.go` file run with `go test`) and JavaScript/TypeScript (`node --test`,
+  or `tsx`). A Rust probe is always an integration test, so a defect that is only
+  reachable through private internals cannot be reproduced; a missing toolchain,
+  image or dependency is a setup error, which leaves the candidate unverified
+  instead of publishing it. The RALE ensemble and ObliVul's risk counter remain
+  Python-only: `rules/lsog_risk.py` parses the file with Python's `ast`, so a
+  non-Python site cannot be ObliVul-verified.
 * A finding needs a probe or an analyzer rerun to be emitted. A real defect
   whose reproduction cannot be synthesised becomes **human review**, not a
   public finding. That is deliberate: the zero-loop contract forbids an
