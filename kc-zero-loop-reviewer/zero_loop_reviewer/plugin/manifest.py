@@ -17,7 +17,7 @@ PROTOCOL = "1"
 DESCRIPTION = (
     "Zero-loop, grounded CI code review: static/CPG ensembles, sandboxed "
     "dual-commit reproduction probes, causal falsification, and one committable "
-    "suggestion per finding (max 3)."
+    "suggestion per finding (all verified findings by default, ceiling 50)."
 )
 
 TOOLS: list[dict[str, Any]] = [
@@ -25,11 +25,12 @@ TOOLS: list[dict[str, Any]] = [
         "name": "review_pr",
         "description": (
             "Run the five-stage grounded review on a pull request or a local "
-            "base..head range. Produces at most three mechanically verified "
-            "findings, each with a one-click suggestion; approval is never based "
-            "on a raw-diff opinion. Takes 1-4 minutes and writes durable receipts. "
-            "Set post=true to publish the single review through the configured "
-            "Git provider (default false)."
+            "base..head range. Produces mechanically verified findings, each "
+            "with a one-click suggestion, up to the configured publication cap "
+            "(all verified findings by default, ceiling 50); approval is never "
+            "based on a raw-diff opinion. Takes 1-4 minutes and writes durable "
+            "receipts. Set post=true to publish the single review through the "
+            "configured Git provider (default false)."
         ),
         "parameters": {
             "type": "object",
