@@ -166,6 +166,16 @@ def _answers(case: dict[str, Any]) -> dict[str, Any]:
 
 
 def _matches(finding, ground_truth: list[dict[str, Any]]) -> bool:
+    if finding.redacted:
+        # A redacted security finding deliberately hides its cited lines.  The
+        # CWE class is the public evidence it still carries; the private record
+        # has the exact site.
+        cwe = (finding.cwe or "").upper()
+        return any(
+            str(truth.get("cwe", "")).upper().split(":")[0] in cwe
+            for truth in ground_truth
+            if truth.get("cwe")
+        )
     for site in finding.cited_sites:
         for truth in ground_truth:
             if site.path == truth["path"] and abs(site.line - int(truth["line"])) <= 2:
@@ -226,6 +236,7 @@ def run_case(case: dict[str, Any], workspace_root: Path, provider: str) -> dict[
         "kind": case["kind"],
         "decision": verdict.decision.value,
         "findings": len(verdict.findings),
+        "finding_sites": [[site.path, site.line] for finding in verdict.findings for site in finding.cited_sites],
         "matched_ground_truth": matched,
         "success": success,
         "degraded": verdict.degraded,

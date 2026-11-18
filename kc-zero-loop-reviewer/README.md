@@ -163,7 +163,7 @@ non-loopback bind without a secret is refused. The secret variable is
 
 `./check.sh` runs everything below. On this machine:
 
-* **416 tests pass** (real git, real Semgrep 1.173.0, real podman 5.4.2,
+* **431 tests pass** (real git, real Semgrep 1.173.0, real podman 5.4.2,
   a real OpenAI-compatible HTTP fake for the client tests).
 * `python3 eval/run_eval.py` on the annotated corpus: **6/6 buggy cases
   intercepted, 0/4 clean or fix-confirming cases flagged**, in ~33 s for all ten cases.
@@ -181,11 +181,43 @@ python3 eval/run_eval.py --provider live
 
 The report is written to `eval/report.json`.
 
+## Using it on the karucode repository
+
+`.github/workflows/zero-loop-review.yml` runs this plugin on `pull_request`
+events. It checks out the PR head with full history, the reviewer from
+`karutoil/karucode-plugins` at a **pinned commit** (`ZERO_LOOP_PLUGIN_REF`), and
+reviews `base..head` with `ci --payload`. The model endpoint comes from
+`ZERO_LOOP_LLM_BASE_URL` / `ZERO_LOOP_MODEL`; the key is the
+`ZERO_LOOP_LLM_API_KEY` Actions secret. Fork and Dependabot PRs are skipped:
+GitHub does not give them repository secrets, and falling back to
+`pull_request_target` would expose the key to untrusted code.
+
+The shipped rule packs cover Python, Rust, TypeScript/JavaScript and GitHub
+Actions YAML. CIVER parses the repaired file with `compileall`, `rustfmt`,
+`node --check` or `esbuild` (installed from `web/package-lock.json`) before it
+publishes a suggestion. A workflow-only PR with pinned actions therefore
+approves with no comments; that is the intended result, not a failure to run.
+Pullfrog and CodeRabbit can comment on a clean YAML diff because they publish
+ungrounded LLM opinions; this reviewer only comments on a mechanically
+verified finding or reports `human_review`.
+
+## Why a clean diff has no comments
+
+The pipeline separates *candidate generation* from *publication*. Triage,
+security and behavioural prompts can produce ideas, but a finding is published
+only when a failing probe, a patch-caused analyzer trace that disappears after
+the repair, or a verified causal perturbation backs it. A model-only hypothesis
+about a YAML file or an unruled Rust line has no mechanical falsifier, so it is
+dropped (`behavioral_scan_filtered` / `unverified_candidates`) rather than
+posted as noise. If the verified set is empty the check approves; if a severe
+candidate cannot be verified it fails open to `human_review` with a receipt.
+
 ## Known limits
 
-* Deep verification is Python-first. Semgrep, ast-grep and the CPG-lite views
-  handle other languages, but probe execution and the RALE AST/CFG views are
-  Python.
+* Probe execution is Python-only.  Rust, TypeScript/JavaScript and GitHub
+  Actions have patch-caused Semgrep rule packs and language-aware CIVER syntax
+  checks, but there is no Rust/TS probe runner yet; a Rust/TS logic bug with no
+  matching rule still ends in `human_review`, never a public comment.
 * A finding needs a probe or an analyzer rerun to be emitted. A real defect
   whose reproduction cannot be synthesised becomes **human review**, not a
   public finding. That is deliberate: the zero-loop contract forbids an

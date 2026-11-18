@@ -1072,9 +1072,10 @@ class Reviewer:
         already_suppressed = [c for c in candidates if c.status is FindingStatus.SUPPRESSED]
         # Two stages can reach the same repair (a rule finding and a semantic
         # monologue on the same line).  Publish one comment, not a duplicate.
-        seen_fixes: dict[str, str] = {}
+        # Keep the security-flagged candidate when the two differ: suppressing
+        # it in favour of a generic copy would also lose its private redaction.
+        groups: dict[str, list[Candidate]] = {}
         deduped: list[Candidate] = []
-        duplicate_suppressed: list[Candidate] = []
         for candidate in candidates:
             if candidate.status is not FindingStatus.VERIFIED:
                 deduped.append(candidate)
@@ -1084,19 +1085,26 @@ class Reviewer:
                 if candidate.verified_fix is not None
                 else "redacted:" + "|".join(f"{s.path}:{s.line}" for s in candidate.cited_sites[:1])
             )
-            if key in seen_fixes:
+            groups.setdefault(key, []).append(candidate)
+        duplicate_suppressed: list[Candidate] = []
+        for group in groups.values():
+            best = max(
+                group,
+                key=lambda c: (bool(c.security_exploitable), c.severity, c.p_combined or 0.0, c.id),
+            )
+            deduped.append(best)
+            for candidate in group:
+                if candidate.id == best.id:
+                    continue
                 duplicate_suppressed.append(
                     candidate.model_copy(
                         update={
                             "status": FindingStatus.SUPPRESSED,
-                            "suppression_reason": f"duplicate_of: {seen_fixes[key]}",
+                            "suppression_reason": f"duplicate_of: {best.id}",
                         }
                     )
                 )
-                run.degraded.append(f"duplicate_suppressed: {candidate.id} duplicates {seen_fixes[key]}")
-                continue
-            seen_fixes[key] = candidate.id
-            deduped.append(candidate)
+                run.degraded.append(f"duplicate_suppressed: {candidate.id} duplicates {best.id}")
         candidates = deduped
         already_suppressed = [*already_suppressed, *duplicate_suppressed]
         selected, suppressed = formatter_mod.select_with_receipts(

@@ -238,7 +238,7 @@ CASES = [
         "    conn.execute(\"create table users (name text)\")\n"
         "    conn.execute(\"insert into users values ('alice')\")\n"
         "    assert find_user(conn, \"alice\") == [(\"alice\",)]\n",
-        "ground_truth": [{"path": "db.py", "line": 6}],
+        "ground_truth": [{"path": "db.py", "line": 6, "cwe": "CWE-89"}],
     },
     {
         "id": "regression_off_by_one_page",
