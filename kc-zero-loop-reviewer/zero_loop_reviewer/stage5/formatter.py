@@ -65,6 +65,9 @@ def is_redacted_flag(candidate: Candidate) -> bool:
 def publishability(candidate: Candidate) -> tuple[bool, str]:
     """``(keep, reason)`` — the reason is recorded on the suppressed candidate."""
     if candidate.status is FindingStatus.ADVISORY:
+        bad = _advisory_self_rejection(candidate)
+        if bad:
+            return False, f"advisory text is not a finding: {bad}"
         return True, ""
     if candidate.status is not FindingStatus.VERIFIED:
         return False, (
@@ -189,6 +192,30 @@ def suggestion_range(fix: Fix) -> tuple[int | None, int | None]:
 
 def _severity_label(severity: int) -> str:
     return SeverityLevel(min(3, max(0, int(severity)))).name
+
+
+def _advisory_self_rejection(candidate: Candidate) -> str:
+    """Reject advisory text that says it is not a defect, or is a placeholder.
+
+    The behavioral model occasionally narrates its way to "not a defect" but
+    still emits a candidate.  Advisory publication is a lower bar, not a
+    licence to post the model's doubts as a bug.
+    """
+    text = f"{candidate.title}\n{candidate.root_cause}"
+    compact = " ".join(text.split())
+    patterns = (
+        r"\?\s*no\s*[—–-]",
+        r"\bnot a (?:real )?(?:defect|bug)\b",
+        r"\bno defect\b",
+        r"\bbudget is respected\b",
+        r"trigger:\s*\.\.\.",
+    )
+    for pattern in patterns:
+        if re.search(pattern, compact, flags=re.IGNORECASE):
+            return f"matches {pattern!r}"
+    if not candidate.root_cause.strip() or candidate.root_cause.strip() in ("...", "…"):
+        return "empty root cause"
+    return ""
 
 
 def _evidence_summary(candidate: Candidate, monitor: MonitorScore | None) -> str:

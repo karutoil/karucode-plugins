@@ -419,3 +419,24 @@ def test_a_both_fail_finding_carries_the_test_repair_note() -> None:
     finding = to_finding(candidate, _elicitation(0.5), _monitor(0.5), 0.5, Redaction())
     assert "tests need repair" in finding.evidence_summary
     assert finding.suggestion == ""
+
+
+def test_an_advisory_that_concludes_not_a_defect_is_suppressed() -> None:
+    candidate = _candidate("advisory", status=FindingStatus.ADVISORY, fix="none")
+    candidate = candidate.model_copy(
+        update={
+            "title": "cache returns stale lines? no — keyed by equality",
+            "root_cause": "The real hazard is X. Not a defect.",
+        }
+    )
+    keep, reason = publishability(candidate)
+    assert keep is False
+    assert "advisory text is not a finding" in reason
+
+
+def test_an_advisory_with_a_placeholder_trigger_is_suppressed() -> None:
+    candidate = _candidate("advisory", status=FindingStatus.ADVISORY, fix="none")
+    candidate = candidate.model_copy(update={"root_cause": "Trigger: ..."})
+    keep, reason = publishability(candidate)
+    assert keep is False
+    assert "advisory text is not a finding" in reason

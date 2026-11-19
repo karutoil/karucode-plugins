@@ -451,6 +451,14 @@ def fallback_verify(
                 counterfactual=updated.verification.counterfactual,
                 civer=updated.verification.civer,
             )
+        elif candidate.status is FindingStatus.ADVISORY:
+            updated.status = FindingStatus.ADVISORY
+            updated.verification = updated.verification.model_copy(
+                update={
+                    "kind": VerificationKind.UNVERIFIED,
+                    "detail": f"{base_detail}; advisory: votes accept, but there is no mechanical signal",
+                }
+            )
         else:
             updated.status = FindingStatus.UNVERIFIED
             updated.verification = updated.verification.model_copy(
@@ -472,7 +480,9 @@ def fallback_verify(
             update={"kind": VerificationKind.UNVERIFIED, "detail": base_detail}
         )
         return updated
-    updated.status = FindingStatus.UNVERIFIED
+    updated.status = (
+        FindingStatus.ADVISORY if candidate.status is FindingStatus.ADVISORY else FindingStatus.UNVERIFIED
+    )
     updated.verification = updated.verification.model_copy(
         update={
             "kind": VerificationKind.UNVERIFIED,

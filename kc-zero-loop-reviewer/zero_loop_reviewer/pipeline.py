@@ -909,7 +909,7 @@ class Reviewer:
 
         # Stage 3C: grounded 5-vote fallback for anything still unverified.
         for candidate in list(updated):
-            if candidate.status is not FindingStatus.UNVERIFIED or budget.remaining() < 15.0:
+            if candidate.status not in (FindingStatus.UNVERIFIED, FindingStatus.ADVISORY) or budget.remaining() < 15.0:
                 continue
             # Rule-backed candidates are verified by CIVER's analyzer rerun;
             # a 5-vote LLM fallback adds no mechanical evidence for them.  The
@@ -919,13 +919,16 @@ class Reviewer:
                 continue
             pair = candidate.verification.probe
             if (
-                pair is not None
+                candidate.status is FindingStatus.UNVERIFIED
+                and pair is not None
                 and pair.head.status is ProbeStatus.FAIL_BEHAVIORAL
                 and candidate.verification.probe_spec is not None
             ):
                 # A head-side failing probe is already the stronger evidence;
                 # CIVER will use it to verify the repair, so five model votes
-                # would only spend budget on a weaker signal.
+                # would only spend budget on a weaker signal.  Advisory findings
+                # still get votes: they are published without a mechanical
+                # check, so a self-contradictory hypothesis must be caught.
                 continue
             started = _now()
             try:
