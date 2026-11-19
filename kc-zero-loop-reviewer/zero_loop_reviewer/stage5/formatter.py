@@ -64,6 +64,8 @@ def is_redacted_flag(candidate: Candidate) -> bool:
 
 def publishability(candidate: Candidate) -> tuple[bool, str]:
     """``(keep, reason)`` — the reason is recorded on the suppressed candidate."""
+    if candidate.status is FindingStatus.ADVISORY:
+        return True, ""
     if candidate.status is not FindingStatus.VERIFIED:
         return False, (
             f"status={candidate.status.value}: an unverified candidate is never published, "
@@ -199,6 +201,12 @@ def _evidence_summary(candidate: Candidate, monitor: MonitorScore | None) -> str
     if monitor is not None:
         parts.append(
             f"monitor {monitor.score:.2f} (dispersion {monitor.dispersion:.2f}, votes {len(monitor.votes)})"
+        )
+    probe = candidate.verification.probe
+    if probe is not None and getattr(probe.classification, "value", "") == "both_fail":
+        parts.append(
+            "probe failed on base and head; tests need repair; this finding is advisory, "
+            "not mechanically verified"
         )
     if evidence.detail:
         parts.append(evidence.detail[:200])
@@ -400,7 +408,7 @@ def _summary(
 
 
 def render_review(verdict: ReviewVerdict, *, bot_login: str, max_body: int = 60000) -> ReviewPayload:
-    """Render exactly one review: one summary body plus at most three comments.
+    """Render exactly one review: one summary body plus the published findings.
 
     Comments are rooted at the first cited line of each published finding and
     carry the verified suggestion.  Two findings on the same line share one

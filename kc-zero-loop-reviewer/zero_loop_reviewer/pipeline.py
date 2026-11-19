@@ -1332,7 +1332,8 @@ class Reviewer:
             )
         else:
             severe_unverified = any(
-                candidate.status is FindingStatus.UNVERIFIED and _severity(candidate.severity) >= 2
+                candidate.status in (FindingStatus.UNVERIFIED, FindingStatus.ADVISORY)
+                and _severity(candidate.severity) >= 2
                 for candidate in candidates
             )
             decision = Decision.HUMAN_REVIEW if severe_unverified else Decision.APPROVE
@@ -1382,7 +1383,7 @@ class Reviewer:
         candidates = deduped
         already_suppressed = [*already_suppressed, *duplicate_suppressed]
         selected, suppressed = formatter_mod.select_with_receipts(
-            [c for c in candidates if c.status in (FindingStatus.VERIFIED, FindingStatus.UNVERIFIED)],
+            [c for c in candidates if c.status in (FindingStatus.VERIFIED, FindingStatus.ADVISORY, FindingStatus.UNVERIFIED)],
             self.settings.max_findings,
         )
         suppressed = [*already_suppressed, *suppressed]

@@ -485,3 +485,19 @@ def test_real_podman_cascade_confirms_the_fix(tmp_path):
         assert leftovers == []
     finally:
         shutil.rmtree(state, ignore_errors=True)
+
+
+def test_both_fail_is_retained_as_advisory_not_verified() -> None:
+    from zero_loop_reviewer.stage3.cascade import _apply_pair
+
+    candidate = Candidate(
+        id="advisory",
+        stage=StageId.PROBE,
+        title="test fails on both sides",
+        evidence=Evidence(kind="llm_hypothesis"),
+        cited_sites=[],
+    )
+    pair = classify_pair(_status(ProbeStatus.FAIL_BEHAVIORAL), _status(ProbeStatus.FAIL_BEHAVIORAL))
+    result = _apply_pair(candidate, pair)
+    assert result.status is FindingStatus.ADVISORY
+    assert "needs repair" in result.suppression_reason

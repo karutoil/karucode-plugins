@@ -270,6 +270,8 @@ loopback and put a TLS reverse proxy in front.
 * Exploitable security findings are redacted in public: only the CWE class and
   the gate status are posted; the trace and verified patch go to a `0600`
   record under `state.dir/private/`, retrievable with `explain_finding`.
+* A both-fail probe is published as advisory with a test-repair note instead of
+  being silently suppressed.
 * The PR description and reply threads never enter the bug-hunting prompt. Only
   the dedicated PR-MCI check reads the description, and it extracts claims; it
   cannot change the review prompt.
@@ -284,7 +286,7 @@ loopback and put a TLS reverse proxy in front.
 
 `./check.sh` runs everything below. On this machine:
 
-* **464 tests** in about 60–67 s (real git 2.47.3, real Semgrep 1.173.0,
+* **467 tests** in about 60–67 s (real git 2.47.3, real Semgrep 1.173.0,
   real podman 5.4.2, a real OpenAI-compatible HTTP fake for the client tests);
   four podman-image tests skip when no image can run pytest.
 * `python3 eval/run_eval.py` on the annotated corpus: **6/6 buggy cases

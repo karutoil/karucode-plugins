@@ -90,6 +90,7 @@ class VerificationKind(str, Enum):
 
 class FindingStatus(str, Enum):
     VERIFIED = "verified"
+    ADVISORY = "advisory"
     SUPPRESSED = "suppressed"
     UNVERIFIED = "unverified"
 

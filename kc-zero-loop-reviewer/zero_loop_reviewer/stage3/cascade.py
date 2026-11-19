@@ -243,6 +243,18 @@ def _apply_pair(candidate: Candidate, pair: ProbePair, spec: ProbeSpec | None = 
     ):
         updated.status = FindingStatus.UNVERIFIED
         return updated
+    if pair.classification is ProbeClassification.BOTH_FAIL:
+        # The probe reproduces a failure on both sides.  That is not a new
+        # regression signal, but it is still a bug report: publish it as
+        # advisory with an explicit "tests need repair" note instead of
+        # silently discarding the candidate.  CIVER can still upgrade it if a
+        # repair passes the full check.
+        updated.status = FindingStatus.ADVISORY
+        updated.suppression_reason = (
+            "probe failed on the base and head commits; the finding is advisory "
+            "and the generated test needs repair before it can verify a regression"
+        )
+        return updated
     updated.status = FindingStatus.VERIFIED
     updated.verification = Verification(
         kind=VerificationKind.PROBE,

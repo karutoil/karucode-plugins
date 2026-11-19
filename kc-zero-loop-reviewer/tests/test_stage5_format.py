@@ -16,6 +16,10 @@ from zero_loop_reviewer.models import (
     Fix,
     MonitorScore,
     MonitorVote,
+    ProbeClassification,
+    ProbePair,
+    ProbeResult,
+    ProbeStatus,
     Redaction,
     ReviewVerdict,
     RiskElicitation,
@@ -386,3 +390,32 @@ def test_render_review_bounds_the_body() -> None:
     payload = render_review(_verdict([finding]), bot_login="bot", max_body=200)
     assert len(payload.body) <= 200
     assert "truncated" in payload.body
+
+
+def test_an_advisory_both_fail_finding_is_published_without_a_fix() -> None:
+    candidate = _candidate("advisory", status=FindingStatus.ADVISORY, fix="none")
+    keep, reason = publishability(candidate)
+    assert keep is True
+    assert reason == ""
+    published, suppressed = select_with_receipts([candidate], 10)
+    assert published == [candidate]
+    assert suppressed == []
+
+
+def test_a_both_fail_finding_carries_the_test_repair_note() -> None:
+    candidate = _candidate("advisory", status=FindingStatus.ADVISORY, fix="none")
+    candidate = candidate.model_copy(
+        update={
+            "verification": Verification(
+                kind=VerificationKind.PROBE,
+                probe=ProbePair(
+                    base=ProbeResult(status=ProbeStatus.FAIL_BEHAVIORAL),
+                    head=ProbeResult(status=ProbeStatus.FAIL_BEHAVIORAL),
+                    classification=ProbeClassification.BOTH_FAIL,
+                ),
+            )
+        }
+    )
+    finding = to_finding(candidate, _elicitation(0.5), _monitor(0.5), 0.5, Redaction())
+    assert "tests need repair" in finding.evidence_summary
+    assert finding.suggestion == ""
