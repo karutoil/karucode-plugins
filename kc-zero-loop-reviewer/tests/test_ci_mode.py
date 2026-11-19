@@ -61,7 +61,7 @@ def _answers(patch: str) -> dict:
             "framework": "pytest",
             "rationale": "boundary",
         },
-        "FallbackVerdict": {"verdict": "uncertain", "confidence": 0.2, "rationale": "probe is evidence"},
+        "FallbackVerdict": {"verdict": "accept", "confidence": 0.9, "rationale": "probe is evidence"},
         "PatchProposal": {"patch": patch, "files_changed": ["calc.py"], "rationale": "clamp"},
         "RiskElicitation": {
             "defect_present": True,

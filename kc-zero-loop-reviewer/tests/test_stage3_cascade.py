@@ -517,3 +517,19 @@ def test_setup_error_is_advisory_with_a_test_repair_note() -> None:
     result = _apply_pair(candidate, pair)
     assert result.status is FindingStatus.ADVISORY
     assert "needs repair" in result.suppression_reason
+
+
+def test_advisory_fallback_requires_a_unanimous_jury() -> None:
+    candidate = _candidate().model_copy(update={"status": FindingStatus.ADVISORY})
+    accepted = fallback_verify(
+        candidate, _context(), _votes("accept", "accept", "accept", "accept", "accept"), settings=Settings()
+    )
+    assert accepted.status is FindingStatus.ADVISORY
+    mixed = fallback_verify(
+        candidate,
+        _context(),
+        _votes("accept", "accept", "accept", "accept", "reject"),
+        settings=Settings(),
+    )
+    assert mixed.status is FindingStatus.SUPPRESSED
+    assert "rejected by at least one" in mixed.suppression_reason

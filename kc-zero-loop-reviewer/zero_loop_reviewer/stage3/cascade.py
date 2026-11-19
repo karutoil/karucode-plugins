@@ -441,6 +441,23 @@ def fallback_verify(
         base_detail = base_detail + "; " + " | ".join(rationales[:5])
     updated = candidate.model_copy(deep=True)
 
+    if candidate.status is FindingStatus.ADVISORY and rejects > 0:
+        # Advisory findings are published without a mechanical check, so a
+        # single grounded rebuttal is enough to keep one out of the PR.  An
+        # all-uncertain jury is treated as no rebuttal; the test-repair note is
+        # still useful when the harness itself could not run.
+        updated.status = FindingStatus.SUPPRESSED
+        updated.suppression_reason = (
+            f"{base_detail}; advisory publication rejected by at least one grounded vote"
+        )
+        updated.verification = updated.verification.model_copy(
+            update={
+                "kind": VerificationKind.UNVERIFIED,
+                "detail": f"{base_detail}; a grounded reviewer rebutted the advisory claim",
+            }
+        )
+        return updated
+
     if accepts > k / 2:
         if updated.verification.counterfactual is not None:
             updated.status = FindingStatus.VERIFIED

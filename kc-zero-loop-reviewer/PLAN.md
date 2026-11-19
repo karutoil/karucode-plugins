@@ -50,5 +50,5 @@ can resume without re-reading the transcript.
 - [x] CI one-shot mode + provider adapters + webhook receiver
 - [x] annotated corpus: 6 buggy / 1 fixed / 3 clean; 6/6 intercepted, 0/4 false positives
 - [x] README, install notes, `check.sh`
-- [x] Full suite: 474 tests (see `./check.sh`)
+- [x] Full suite: 476 tests (see `./check.sh`)
 - [x] change-graph decomposition, unit-aware batches, cross-unit integration pass

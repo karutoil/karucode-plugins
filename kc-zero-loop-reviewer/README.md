@@ -270,8 +270,10 @@ loopback and put a TLS reverse proxy in front.
 * Exploitable security findings are redacted in public: only the CWE class and
   the gate status are posted; the trace and verified patch go to a `0600`
   record under `state.dir/private/`, retrievable with `explain_finding`.
-* A both-fail probe is published as advisory with a test-repair note instead of
-  being silently suppressed.
+* A both-fail or setup-error probe is published as advisory with a test-repair
+  note instead of being silently suppressed. Advisory text that says it is
+  working as intended, self-dismisses, or has a hedge is dropped; an advisory
+  is also dropped when **any** of the five grounded reviewers rebuts it.
 * The PR description and reply threads never enter the bug-hunting prompt. Only
   the dedicated PR-MCI check reads the description, and it extracts claims; it
   cannot change the review prompt.
@@ -286,7 +288,7 @@ loopback and put a TLS reverse proxy in front.
 
 `./check.sh` runs everything below. On this machine:
 
-* **474 tests** in about 60–67 s (real git 2.47.3, real Semgrep 1.173.0,
+* **476 tests** in about 60–67 s (real git 2.47.3, real Semgrep 1.173.0,
   real podman 5.4.2, a real OpenAI-compatible HTTP fake for the client tests);
   four podman-image tests skip when no image can run pytest.
 * `python3 eval/run_eval.py` on the annotated corpus: **6/6 buggy cases
@@ -517,8 +519,8 @@ Analyzer findings are suppressed before they can become candidates when they sit
 on a configured suppression path (`tests/`, `test/`, `vendor/`, `third_party/`),
 inside test code, on a line carrying `nosec` / `semgrep-ignore` /
 `zero-loop:ignore`, or — for an injection CWE — on a line where a configured
-trusted sanitizer is applied. Test files are still reviewed behaviourally;
-coverage simply does not require their lines.
+trusted sanitizer is applied. Test files are excluded from the behavioural
+review and coverage; their normal suites cover them.
 
 This is a **coverage** guarantee, not a recall guarantee. On the 9.6k-line PR #17
 it covered all **6,492 production changed lines** with zero missing assignments

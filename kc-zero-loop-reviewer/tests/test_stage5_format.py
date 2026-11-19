@@ -471,3 +471,17 @@ def test_summary_reports_production_and_code_coverage() -> None:
     assert "3722/3722 production changed lines" in body
     assert "6436/6436 review-eligible changed lines" in body
     assert "test files" in body
+
+
+def test_advisory_text_that_concedes_intent_is_suppressed() -> None:
+    for root in (
+        "Working as intended; the cache bound is documented.",
+        "The premise does not hold: this path is already guarded.",
+        "Hmm, after re-checking there is no defect.",
+        "This may still be a problem if the browser uses another port.",
+    ):
+        candidate = _candidate("advisory", status=FindingStatus.ADVISORY, fix="none")
+        candidate = candidate.model_copy(update={"root_cause": root})
+        keep, reason = publishability(candidate)
+        assert keep is False, root
+        assert "advisory text is not a finding" in reason

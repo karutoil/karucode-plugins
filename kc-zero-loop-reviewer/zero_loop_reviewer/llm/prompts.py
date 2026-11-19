@@ -294,6 +294,8 @@ Rules:
 - Every candidate cites a file and line that exists in the changed code above. A hallucinated site makes the candidate unusable.
 - root_cause must name the mechanism and the triggering input, not a style preference.
 - Do not report naming, formatting, missing tests, or "consider refactoring".
+- Do not report a documented/intentional trade, a cache bound, or a guard that already exists in the changed code. A code comment or type contract that defines the behaviour is evidence against a defect, not for one.
+- If your own root_cause can rebut the claim, do not emit it.
 - If the change looks correct, return an empty list. An empty list is a valid, useful answer.
 - Do not decide whether the change should ship.""",
     )
@@ -313,7 +315,7 @@ Check every await boundary and lifecycle transition:
 - callback isolation: a status/observer callback invoked before a timer, claim, cleanup or transition can throw and strand the state machine.
 - queue replay: queued events/deltas replayed after a snapshot or seed when the snapshot already contains their effect; check sequence watermarks.
 - lifecycle: a path that leaves boot/session/stream stuck in loading, connecting or auth after a superseded run.
-Return at most three candidates. Cite exact changed lines and a concrete trigger. Do not return a candidate whose own root_cause rebuts it.""",
+Return at most three candidates. Cite exact changed lines and a concrete trigger. Do not report a documented/intentional trade or a guard already present in the code. Do not return a candidate whose own root_cause rebuts it.""",
     )
     return Prompt(stage="behavioral", system=SYSTEM, user=user, schema_name="BehavioralCandidates")
 
@@ -323,11 +325,11 @@ def grounded_review_prompt(candidate: Candidate, context: ContextSlice) -> Promp
         _schema("FallbackVerdict", FallbackVerdict),
         _evidence("candidate", candidate.model_dump(mode="json"), 14000),
         _evidence("context", context.text, 16000),
-        """Task: decide whether the candidate defect is real, using only the evidence.
-- accept: the changed code can exhibit the failure described, and you can name the path.
-- reject: the claimed path is impossible, already guarded, or not on a changed line.
-- uncertain: the evidence is insufficient. Abstain rather than guess.
-Do not rewrite the finding, and do not propose a patch here.""",
+        """Task: try to DISPROVE the candidate defect, using only the evidence.
+- reject: the claimed path is impossible, already guarded, contradicted by a code comment or type contract, depends on browser behaviour not shown, or the finding's own root_cause concedes it.
+- accept: the changed code can exhibit the failure described, you can name the exact path, and the evidence does not contain a contrary guard.
+- uncertain: the evidence is insufficient. Default to this when you would have to assume.
+Do not accept on plausibility. Do not rewrite the finding, and do not propose a patch here.""",
     )
     return Prompt(stage="fallback", system=SYSTEM, user=user, schema_name="FallbackVerdict")
 

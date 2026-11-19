@@ -115,7 +115,7 @@ def _answers(patch: str, *, hypotheses=1, behavioral_category="correctness") -> 
             "framework": "pytest",
             "rationale": "boundary input",
         },
-        "FallbackVerdict": {"verdict": "uncertain", "confidence": 0.4, "rationale": "the probe is the evidence"},
+        "FallbackVerdict": {"verdict": "accept", "confidence": 0.9, "rationale": "the probe is the evidence"},
         "PatchProposal": {"patch": patch, "files_changed": ["calc.py"], "rationale": "clamp the index"},
         "RiskElicitation": {
             "defect_present": True,
@@ -385,7 +385,7 @@ def test_exploitable_security_finding_is_redacted_but_recorded_privately(tmp_pat
             "framework": "pytest",
             "rationale": "injection",
         },
-        "FallbackVerdict": {"verdict": "uncertain", "confidence": 0.3, "rationale": "probe is the evidence"},
+        "FallbackVerdict": {"verdict": "accept", "confidence": 0.9, "rationale": "probe is the evidence"},
         "PatchProposal": {
             "patch": _patch(head_file, fixed, "db.py"),
             "files_changed": ["db.py"],

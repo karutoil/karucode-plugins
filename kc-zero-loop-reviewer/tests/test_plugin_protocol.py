@@ -272,7 +272,7 @@ def test_review_pr_runs_the_whole_pipeline_through_the_tool_surface(tmp_path):
             "framework": "pytest",
             "rationale": "boundary",
         },
-        "FallbackVerdict": {"verdict": "uncertain", "confidence": 0.3, "rationale": "probe is evidence"},
+        "FallbackVerdict": {"verdict": "accept", "confidence": 0.9, "rationale": "probe is evidence"},
         "PatchProposal": {"patch": patch, "files_changed": ["calc.py"], "rationale": "clamp index"},
         "RiskElicitation": {
             "defect_present": True,
