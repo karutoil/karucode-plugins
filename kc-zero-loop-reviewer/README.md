@@ -286,7 +286,7 @@ loopback and put a TLS reverse proxy in front.
 
 `./check.sh` runs everything below. On this machine:
 
-* **471 tests** in about 60–67 s (real git 2.47.3, real Semgrep 1.173.0,
+* **472 tests** in about 60–67 s (real git 2.47.3, real Semgrep 1.173.0,
   real podman 5.4.2, a real OpenAI-compatible HTTP fake for the client tests);
   four podman-image tests skip when no image can run pytest.
 * `python3 eval/run_eval.py` on the annotated corpus: **6/6 buggy cases
@@ -496,7 +496,10 @@ reviewed in a few minutes.
 
 Every changed line of a production source file must be assigned to a behavioural
 batch; a missing assignment is recorded as
-`behavioral_hunk_coverage_incomplete` and stops an approval. The full enclosing
+`behavioral_hunk_coverage_incomplete` and stops an approval. Test files are
+reviewed in the behavioural batches too, but they are excluded from the
+production coverage denominator; the review prints a second code-coverage
+line so the larger 6k-line diff is not mistaken for uncovered production code. The full enclosing
 function of each changed site is added to the context, not just the diff hunk and
 its 1-hop signatures. When more anchored hypotheses exist than the candidate cap
 allows, the excess is recorded as `behavioral_candidate_coverage_incomplete`.

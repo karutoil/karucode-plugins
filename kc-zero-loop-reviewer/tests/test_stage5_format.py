@@ -456,3 +456,18 @@ def test_degraded_modes_drop_raw_test_harness_output() -> None:
     assert "probe_synthesis:" in payload.body
     assert "details in receipts" in payload.body
     assert len(payload.body) < 4000
+
+
+def test_summary_reports_production_and_code_coverage() -> None:
+    verdict = _verdict([]).model_copy(
+        update={
+            "coverage_lines": 3722,
+            "coverage_covered": 3722,
+            "coverage_code_lines": 6436,
+            "coverage_code_covered": 6436,
+        }
+    )
+    body = render_review(verdict, bot_login="bot").body
+    assert "3722/3722 production changed lines" in body
+    assert "6436/6436 review-eligible changed lines" in body
+    assert "test files" in body

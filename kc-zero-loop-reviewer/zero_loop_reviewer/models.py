@@ -744,6 +744,8 @@ class ReviewVerdict(StrictModel):
     input_sha256: str = ""
     coverage_lines: int = Field(default=0, ge=0)
     coverage_covered: int = Field(default=0, ge=0)
+    coverage_code_lines: int = Field(default=0, ge=0)
+    coverage_code_covered: int = Field(default=0, ge=0)
     schema_version: int = 1
 
 

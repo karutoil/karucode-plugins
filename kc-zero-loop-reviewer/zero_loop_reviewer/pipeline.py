@@ -154,6 +154,8 @@ class _Run:
     change_plan: ChangePlan | None = None
     coverage_total: int = 0
     coverage_covered: int = 0
+    coverage_code_total: int = 0
+    coverage_code_covered: int = 0
 
 
 class Reviewer:
@@ -746,10 +748,20 @@ class Reviewer:
             run.degraded.append(
                 f"behavioral_candidate_coverage_incomplete: {over_cap} anchored hypothesis(es) exceeded the candidate cap"
             )
+        eligible = [
+            patch
+            for patch in diff.files
+            if _behavioral_eligible(patch, self.settings.probe_adapters)
+        ]
         required = {
             (patch.path, line)
-            for patch in diff.files
-            if _behavioral_eligible(patch, self.settings.probe_adapters) and not _is_test_path(patch.path)
+            for patch in eligible
+            if not _is_test_path(patch.path)
+            for line in patch.changed_lines
+        }
+        code_required = {
+            (patch.path, line)
+            for patch in eligible
             for line in patch.changed_lines
         }
         covered = {
@@ -761,6 +773,8 @@ class Reviewer:
         missing = required - covered
         run.coverage_total = len(required)
         run.coverage_covered = len(required & covered)
+        run.coverage_code_total = len(code_required)
+        run.coverage_code_covered = len(code_required & covered)
         if missing:
             run.degraded.append(
                 f"behavioral_hunk_coverage_incomplete: {len(missing)} production hunk(s) were not assigned to a batch"
@@ -1521,6 +1535,8 @@ class Reviewer:
             input_sha256=run.context.input_sha256 if run.context is not None else "",
             coverage_lines=run.coverage_total,
             coverage_covered=run.coverage_covered,
+            coverage_code_lines=run.coverage_code_total,
+            coverage_code_covered=run.coverage_code_covered,
         )
 
 

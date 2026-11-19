@@ -439,6 +439,12 @@ def _summary(
             f"Coverage: {verdict.coverage_covered}/{verdict.coverage_lines} "
             "production changed lines assigned to a behavioural batch."
         )
+        if verdict.coverage_code_lines > verdict.coverage_lines:
+            lines.append(
+                f"Code coverage: {verdict.coverage_code_covered}/{verdict.coverage_code_lines} "
+                "review-eligible changed lines, including test files (tests are not part of "
+                "the production coverage guarantee)."
+            )
 
     published = [finding for finding in findings if not finding.redacted]
     redacted = [finding for finding in findings if finding.redacted]
