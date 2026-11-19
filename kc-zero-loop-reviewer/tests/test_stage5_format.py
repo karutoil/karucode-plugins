@@ -440,3 +440,19 @@ def test_an_advisory_with_a_placeholder_trigger_is_suppressed() -> None:
     keep, reason = publishability(candidate)
     assert keep is False
     assert "advisory text is not a finding" in reason
+
+
+def test_degraded_modes_drop_raw_test_harness_output() -> None:
+    reason = (
+        "probe_synthesis: attempt 1: TAP version 13\n"
+        "node:internal/modules/run_main:123\n"
+        "    throw new Error('massive raw output')\n"
+        "duration_ms: 12345"
+    )
+    verdict = _verdict([], decision=Decision.HUMAN_REVIEW, degraded=[reason, reason])
+    payload = render_review(verdict, bot_login="bot")
+    assert "node:internal" not in payload.body
+    assert "massive raw output" not in payload.body
+    assert "probe_synthesis:" in payload.body
+    assert "details in receipts" in payload.body
+    assert len(payload.body) < 4000

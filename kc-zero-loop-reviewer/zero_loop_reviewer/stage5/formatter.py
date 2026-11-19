@@ -362,6 +362,62 @@ def _decision_basis(verdict: ReviewVerdict) -> str:
     return "no finding crossed the gate and the independent monitor agreed with the reviewer"
 
 
+def _compact_degraded(reasons: list[str], *, redact: bool = False) -> list[str]:
+    """Turn raw stage diagnostics into a short, PR-author-readable list.
+
+    Probe synthesis records the full test-harness stderr (TAP output, Node
+    stack traces, tracebacks) in the receipt and in ``verdict.degraded``.  A
+    review body is not a log file: keep the category and a count, never the
+    multi-kilobyte child-process dump.
+    """
+    if not reasons:
+        return []
+    buckets: dict[str, list[str]] = {}
+    order: list[str] = []
+    for raw in reasons:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        key = text.split(":", 1)[0].strip() or "other"
+        if key not in buckets:
+            buckets[key] = []
+            order.append(key)
+        buckets[key].append(text)
+    out: list[str] = []
+    for key in order[:12]:
+        items = buckets[key]
+        noisy = key in {
+            "probe_synthesis",
+            "civer_unverified",
+            "fallback_degraded",
+            "fusion_degraded",
+            "probe_pair",
+        } or any(
+            marker in item
+            for item in items
+            for marker in ("Traceback", "TAP version", "node:internal/", "duration_ms")
+        )
+        if redact:
+            if len(items) > 1:
+                out.append(f"{key}: {len(items)} occurrence(s)")
+            else:
+                out.append(key)
+            continue
+        if noisy or len(items) > 1:
+            first = " ".join(items[0].splitlines()[0].split())
+            prefix = key + ":"
+            if first.startswith(prefix):
+                first = first[len(prefix):].strip()
+            if len(first) > 180:
+                first = first[:177].rstrip() + "..."
+            suffix = f" ({len(items)} occurrence(s); details in receipts)" if len(items) > 1 else " (test output omitted)"
+            out.append(f"{key}: {first} {suffix}".strip())
+        else:
+            first = " ".join(items[0].splitlines()[0].split())
+            out.append(first[:240])
+    return out
+
+
 def _summary(
     verdict: ReviewVerdict,
     findings: list[Finding],
@@ -418,13 +474,9 @@ def _summary(
     )
 
     lines.extend(["", "### Degraded modes"])
-    degraded = verdict.degraded
-    if verdict.redacted_count:
-        # A redacted review must not leak execution detail through the degraded
-        # list: keep the category, drop the free-form tail that may quote code.
-        degraded = [reason.split(":", 1)[0] for reason in degraded]
+    degraded = _compact_degraded(verdict.degraded, redact=bool(verdict.redacted_count))
     if degraded:
-        lines.extend(f"- {reason}" for reason in degraded[:20])
+        lines.extend(f"- {reason}" for reason in degraded)
     else:
         lines.append("- none")
 
