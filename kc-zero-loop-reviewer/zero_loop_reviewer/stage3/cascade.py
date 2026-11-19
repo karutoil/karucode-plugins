@@ -237,10 +237,17 @@ def _apply_pair(candidate: Candidate, pair: ProbePair, spec: ProbeSpec | None = 
             "so the defect the candidate describes is not reproducible in this change"
         )
         return updated
-    if pair.classification in (
-        ProbeClassification.SETUP_ERROR,
-        ProbeClassification.INCONCLUSIVE,
-    ):
+    if pair.classification is ProbeClassification.SETUP_ERROR:
+        # A generated test that cannot run is not evidence against the PR, but
+        # it is also not a reason to discard the bug report.  Publish the
+        # candidate as advisory with a test-repair note; a human can decide.
+        updated.status = FindingStatus.ADVISORY
+        updated.suppression_reason = (
+            "the generated probe could not run; the finding is advisory and the "
+            "test needs repair before it can verify anything"
+        )
+        return updated
+    if pair.classification is ProbeClassification.INCONCLUSIVE:
         updated.status = FindingStatus.UNVERIFIED
         return updated
     if pair.classification is ProbeClassification.BOTH_FAIL:
@@ -274,7 +281,8 @@ def _pair_degraded(pair: ProbePair) -> list[str]:
         result = pair.base if side == "base" else pair.head
         return [
             "probe_setup_error: the generated probe could not run on the "
-            f"{side} commit ({result.failure_kind or result.status.value}); discarded, never counted against the PR"
+            f"{side} commit ({result.failure_kind or result.status.value}); "
+            "published as advisory with a test-repair note, never as a verified finding"
         ]
     if pair.classification is ProbeClassification.INCONCLUSIVE:
         return [

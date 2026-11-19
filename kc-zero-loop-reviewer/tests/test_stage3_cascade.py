@@ -265,7 +265,7 @@ def test_a_regression_is_verified(tmp_path):
     assert candidates[0].status is FindingStatus.VERIFIED
 
 
-def test_a_setup_error_on_the_base_discards_the_pair(tmp_path):
+def test_a_setup_error_on_the_base_becomes_an_advisory(tmp_path):
     repo, bundle, _, _ = _repo_with_delta(tmp_path)
     sandbox = FakeSandbox(
         [_status(ProbeStatus.SETUP_ERROR, failure_kind="import", stderr="No module named 'nope'"), _pass()]
@@ -273,10 +273,10 @@ def test_a_setup_error_on_the_base_discards_the_pair(tmp_path):
     settings = Settings().with_paths(tmp_path / "state")
     candidates, pairs, degraded = run_cascade(_candidate(), _context(), _probe_llm(), sandbox, repo, bundle, settings)
     assert pairs[0].classification is ProbeClassification.SETUP_ERROR
-    assert candidates[0].status is FindingStatus.UNVERIFIED
+    assert candidates[0].status is FindingStatus.ADVISORY
     assert candidates[0].verification.kind is VerificationKind.UNVERIFIED
     assert any("probe_setup_error" in reason and "import" in reason for reason in degraded)
-    assert any("never counted against the PR" in reason for reason in degraded)
+    assert any("published as advisory" in reason for reason in degraded)
 
 
 def test_a_sandbox_failure_is_never_turned_into_approval(tmp_path):
@@ -498,6 +498,22 @@ def test_both_fail_is_retained_as_advisory_not_verified() -> None:
         cited_sites=[],
     )
     pair = classify_pair(_status(ProbeStatus.FAIL_BEHAVIORAL), _status(ProbeStatus.FAIL_BEHAVIORAL))
+    result = _apply_pair(candidate, pair)
+    assert result.status is FindingStatus.ADVISORY
+    assert "needs repair" in result.suppression_reason
+
+
+def test_setup_error_is_advisory_with_a_test_repair_note() -> None:
+    from zero_loop_reviewer.stage3.cascade import _apply_pair
+
+    candidate = Candidate(
+        id="setup",
+        stage=StageId.PROBE,
+        title="probe could not run",
+        evidence=Evidence(kind="llm_hypothesis"),
+        cited_sites=[],
+    )
+    pair = classify_pair(_status(ProbeStatus.SETUP_ERROR), _status(ProbeStatus.PASS))
     result = _apply_pair(candidate, pair)
     assert result.status is FindingStatus.ADVISORY
     assert "needs repair" in result.suppression_reason

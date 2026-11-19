@@ -203,9 +203,15 @@ def _evidence_summary(candidate: Candidate, monitor: MonitorScore | None) -> str
             f"monitor {monitor.score:.2f} (dispersion {monitor.dispersion:.2f}, votes {len(monitor.votes)})"
         )
     probe = candidate.verification.probe
-    if probe is not None and getattr(probe.classification, "value", "") == "both_fail":
+    classification = getattr(probe.classification, "value", "") if probe is not None else ""
+    if classification == "both_fail":
         parts.append(
             "probe failed on base and head; tests need repair; this finding is advisory, "
+            "not mechanically verified"
+        )
+    elif classification == "setup_error":
+        parts.append(
+            "the generated probe could not run; tests need repair; this finding is advisory, "
             "not mechanically verified"
         )
     if evidence.detail:
