@@ -1537,6 +1537,8 @@ def _analyzer_candidates(findings: Sequence[AnalyzerFinding]) -> list[Candidate]
     for finding in findings:
         if finding.suppressed or not finding.patch_caused:
             continue
+        if finding.test_context or _is_test_path(finding.path):
+            continue
         site = CitedSite(path=finding.path, line=finding.line, end_line=finding.end_line, symbol=finding.rule_id)
         category = _category_of(finding)
         severity = _severity(finding.severity)
@@ -1698,6 +1700,7 @@ def _is_test_path(path: str) -> bool:
         or ".spec." in low
         or low.endswith("_test.py")
         or low.endswith("_test.rs")
+        or Path(low).name in ("tests.rs", "test.rs", "tests.py", "test.py")
         or re.search(
             r"(_test|_spec)\.(go|rb|php|exs|ex|cs|swift|lua|kt|java|scala|c|cc|cpp|h|hpp|fs|fsx|jl|pl|pm)$",
             low,
