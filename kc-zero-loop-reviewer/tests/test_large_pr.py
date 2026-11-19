@@ -123,3 +123,16 @@ def test_test_files_are_not_sent_to_the_behavioural_reviewer(tmp_path) -> None:
     batches, _, _ = _behavioral_batches(diff)
     assigned = {patch.path for batch in batches for patch in batch}
     assert assigned == {"pkg/prod.py"}
+
+
+def test_async_state_pass_is_selected_for_stateful_changes() -> None:
+    from zero_loop_reviewer.models import FilePatch, Hunk
+    from zero_loop_reviewer.pipeline import _needs_async_state_pass
+
+    patch = FilePatch(
+        path="web/src/state/actions.ts",
+        hunks=[Hunk(old_start=1, old_lines=1, new_start=1, new_lines=1, lines=["+  await api.getHealth();", "+  store.health.value = h;"])],
+    )
+    assert _needs_async_state_pass([patch]) is True
+    plain = FilePatch(path="README.md", hunks=[])
+    assert _needs_async_state_pass([plain]) is False

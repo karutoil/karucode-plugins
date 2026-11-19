@@ -21,7 +21,7 @@ from .config import Settings, StageModel, ensure_state_dirs
 from .errors import ContractViolation, LLMError, ReviewError
 from .gitops import GitError, GitRepo
 from .llm.client import JSONLLM, NullLLM, OpenAICompatibleClient, build_llm
-from .llm.prompts import behavioral_prompt, integration_prompt, triage_prompt
+from .llm.prompts import async_state_prompt, behavioral_prompt, integration_prompt, triage_prompt
 from .models import (
     AnalyzerFinding,
     AttemptStatus,
@@ -79,13 +79,13 @@ MAX_BEHAVIOR_BATCHES = 24
 EXHAUSTIVE_BEHAVIOR_BATCHES = 100
 MAX_BEHAVIOR_FILES_PER_BATCH = 4
 MAX_BEHAVIOR_BATCH_CHARS = 30_000
-MAX_BEHAVIOR_CANDIDATES = 24
+MAX_BEHAVIOR_CANDIDATES = 48
 EXHAUSTIVE_BEHAVIOR_CANDIDATES = 100
 BEHAVIOR_WORKERS = 4
 
 #: Stage 3/4 are expensive and model-backed; the top candidates get the budget,
 #: the rest stay unverified and therefore cannot be published silently.
-MAX_PROBED_CANDIDATES = 32
+MAX_PROBED_CANDIDATES = 48
 MAX_CIVER_CANDIDATES = 32
 from .stage5 import redaction as redaction_mod
 
@@ -623,7 +623,16 @@ class Reviewer:
                 BehavioralCandidates,
                 stage_model=self.settings.llm.reviewer,
             )
-            return index, list(answer.value.candidates)
+            drafts = list(answer.value.candidates)
+            if _needs_async_state_pass(batch):
+                second = self.llm.complete(
+                    "behavioral",
+                    async_state_prompt(batch_diff, batch_context),
+                    BehavioralCandidates,
+                    stage_model=self.settings.llm.reviewer,
+                )
+                drafts.extend(second.value.candidates)
+            return index, drafts
 
         def accept(drafts: Sequence[Any], scope: DiffBundle) -> None:
             nonlocal rejected, over_cap
@@ -1829,6 +1838,15 @@ def _split_large_patch(patch: FilePatch) -> tuple[list[FilePatch], bool]:
 
 def _hunk_key(path: str, hunk) -> str:
     return f"{path}:{hunk.old_start}:{hunk.new_start}:{hunk.header}"
+
+
+def _needs_async_state_pass(batch: list[FilePatch]) -> bool:
+    """True when a batch contains async state/lifecycle code worth a second look."""
+    text = "\n".join(patch.patch_text() for patch in batch)
+    return any(
+        token in text
+        for token in ("await ", "async ", "isCurrent", "isActive", "setState", "store.", "refreshQueue", "onStatus")
+    )
 
 
 def _behavioral_batches(

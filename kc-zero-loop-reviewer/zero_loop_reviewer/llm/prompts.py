@@ -300,6 +300,24 @@ Rules:
     return Prompt(stage="behavioral", system=SYSTEM, user=user, schema_name="BehavioralCandidates")
 
 
+def async_state_prompt(diff: DiffBundle, context: ContextSlice) -> Prompt:
+    """Second-opinion review for async state ownership and lifecycle races."""
+    user = _join(
+        _schema("BehavioralCandidates", BehavioralCandidates),
+        _evidence("changed_code", _diff_digest(diff), 120000),
+        _evidence("one_hop_context", context.text, 120000),
+        """Task: second-opinion async/state consistency review of the CHANGED lines.
+Find concrete defects a reproduction test or a state-machine trace can demonstrate. Do not review style.
+Check every await boundary and lifecycle transition:
+- stale ownership: after an await, an older request/run can write state over a newer one; the isCurrent/isActive/generation check must happen before each write, not at the end of the function.
+- callback isolation: a status/observer callback invoked before a timer, claim, cleanup or transition can throw and strand the state machine.
+- queue replay: queued events/deltas replayed after a snapshot or seed when the snapshot already contains their effect; check sequence watermarks.
+- lifecycle: a path that leaves boot/session/stream stuck in loading, connecting or auth after a superseded run.
+Return at most three candidates. Cite exact changed lines and a concrete trigger. Do not return a candidate whose own root_cause rebuts it.""",
+    )
+    return Prompt(stage="behavioral", system=SYSTEM, user=user, schema_name="BehavioralCandidates")
+
+
 def grounded_review_prompt(candidate: Candidate, context: ContextSlice) -> Prompt:
     user = _join(
         _schema("FallbackVerdict", FallbackVerdict),
