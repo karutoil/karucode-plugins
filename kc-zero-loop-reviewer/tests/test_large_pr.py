@@ -107,3 +107,19 @@ def test_a_truncated_context_cannot_approve(tmp_path) -> None:
     )
     assert verdict.decision is Decision.HUMAN_REVIEW
     assert any(reason.startswith("context_truncated:") for reason in verdict.degraded)
+
+
+def test_test_files_are_not_sent_to_the_behavioural_reviewer(tmp_path) -> None:
+    fixture = make_repo(tmp_path, "tests-excluded")
+    fixture.commit("base", **{"pkg/prod.py": "def f(x):\n    return x\n"})
+    fixture.commit(
+        "head",
+        **{
+            "pkg/prod.py": "def f(x):\n    return x + 1\n",
+            "tests/test_prod.py": "def test_f():\n    assert f(1) == 2\n",
+        },
+    )
+    diff = GitRepo(fixture.root).diff("HEAD~1", "HEAD")
+    batches, _, _ = _behavioral_batches(diff)
+    assigned = {patch.path for batch in batches for patch in batch}
+    assert assigned == {"pkg/prod.py"}

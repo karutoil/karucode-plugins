@@ -752,6 +752,7 @@ class Reviewer:
             patch
             for patch in diff.files
             if _behavioral_eligible(patch, self.settings.probe_adapters)
+            and not _is_test_path(patch.path)
         ]
         required = {
             (patch.path, line)
@@ -1844,7 +1845,11 @@ def _behavioral_batches(
     they are split over several size-bounded batches.
     """
     files = sorted(
-        (patch for patch in diff.files if _behavioral_eligible(patch, adapters)),
+        (
+            patch
+            for patch in diff.files
+            if _behavioral_eligible(patch, adapters) and not _is_test_path(patch.path)
+        ),
         key=lambda patch: (-_behavioral_weight(patch), patch.path),
     )
     if not files:
